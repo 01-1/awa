@@ -21,6 +21,11 @@ def sh(cmd, cwd):
                           capture_output=True, text=True).stdout.strip()
 
 
+def store(repo):
+    """git command line reading repo's history store."""
+    return f"git --git-dir={awa.store_dir(repo)}"
+
+
 def wait_for(fn, timeout=5.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -37,6 +42,7 @@ class Base(unittest.TestCase):
         self.repo = self.tmp / "proj"
         self.repo.mkdir()
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "config")
+        os.environ["XDG_DATA_HOME"] = str(self.tmp / "data")
         for k in ("AUTHOR", "COMMITTER"):
             os.environ[f"GIT_{k}_NAME"] = "t"
             os.environ[f"GIT_{k}_EMAIL"] = "t@t"
@@ -67,25 +73,58 @@ class Snapshot(Base):
         c1 = awa.snapshot(self.repo)
         self.assertEqual(self.head(), head)
         self.assertIn("?? b.txt", sh("git status --porcelain", self.repo))
-        files = sh(f"git ls-tree -r --name-only {c1}", self.repo).split()
+        files = sh(f"{store(self.repo)} ls-tree -r --name-only {c1}",
+                   self.repo).split()
         self.assertIn("b.txt", files)
         self.assertNotIn("node_modules/x.js", files)
         self.assertIsNone(awa.snapshot(self.repo))  # unchanged: no commit
         (self.repo / "b.txt").write_text("b2\n")
         c2 = awa.snapshot(self.repo)
-        self.assertEqual(sh(f"git rev-parse {c2}^", self.repo), c1)
+        self.assertEqual(sh(f"{store(self.repo)} rev-parse {c2}^", self.repo),
+                         c1)
+
+    def test_history_lives_only_in_the_store(self):
+        sh("echo s > sub.txt && git add -A && git commit -qm sub", self.repo)
+        (self.repo / "b.txt").write_text("b\n")
+        c = awa.snapshot(self.repo)
+        self.assertEqual(sh("git for-each-ref refs/awa", self.repo), "")
+        self.assertNotEqual(subprocess.run(
+            ["git", "cat-file", "-e", c], cwd=self.repo).returncode, 0)
+        st = awa.store_dir(self.repo)
+        self.assertTrue(st.is_relative_to(self.tmp / "data" / "awa"))
+        subprocess.run(["rm", "-rf", str(self.repo)], check=True)
+        sh(f"git --git-dir={st} fsck --strict --no-dangling", self.tmp)
+        self.assertEqual(sh(f"git --git-dir={st} show {c}:sub.txt", self.tmp),
+                         "s")  # committed in the repo, still in the store
+
+    def test_moves_old_in_repo_history_to_the_store(self):
+        tree = sh("git write-tree", self.repo)
+        old = sh(f"echo old | git commit-tree {tree}", self.repo)
+        kept = sh(f"echo kept | git commit-tree {tree}", self.repo)
+        sh(f"git update-ref {awa.RECORD_REF} {old} && git update-ref "
+           f"{awa.RECORD_REF}-w1-20260101T000000 {kept}", self.repo)
+        (self.repo / "b.txt").write_text("b\n")
+        c = awa.snapshot(self.repo)
+        self.assertEqual(sh(f"{store(self.repo)} rev-parse {c}^", self.repo),
+                         old)
+        self.assertEqual(sh(f"{store(self.repo)} rev-parse "
+                            f"{awa.RECORD_REF}-w1-20260101T000000",
+                            self.repo), kept)
+        self.assertEqual(sh("git for-each-ref refs/awa", self.repo), "")
 
     def test_follows_tracked_and_ignore_rules(self):
         sh("echo t > tracked.log && git add -f tracked.log && "
            "git commit -qm log", self.repo)
         (self.repo / "later.txt").write_text("1\n")
         c1 = awa.snapshot(self.repo)
-        files = sh(f"git ls-tree -r --name-only {c1}", self.repo).split()
+        files = sh(f"{store(self.repo)} ls-tree -r --name-only {c1}",
+                   self.repo).split()
         self.assertIn("tracked.log", files)  # tracked despite *.log
         self.assertIn("later.txt", files)
         sh("echo later.txt >> .gitignore", self.repo)
         c2 = awa.snapshot(self.repo)
-        files = sh(f"git ls-tree -r --name-only {c2}", self.repo).split()
+        files = sh(f"{store(self.repo)} ls-tree -r --name-only {c2}",
+                   self.repo).split()
         self.assertNotIn("later.txt", files)  # now ignored: dropped
 
 
@@ -139,17 +178,18 @@ class Recording(Base):
         threading.Thread(target=awa.record_loop, args=(self.repo,),
                          daemon=True).start()
         self.assertTrue(wait_for(lambda: subprocess.run(
-            ["git", "rev-parse", "-q", "--verify", awa.RECORD_REF],
-            cwd=self.repo, capture_output=True).returncode == 0))
-        start = sh(f"git rev-parse {awa.RECORD_REF}", self.repo)
+            ["git", "--git-dir", str(awa.store_dir(self.repo)), "rev-parse",
+             "-q", "--verify", awa.RECORD_REF],
+            capture_output=True).returncode == 0))
+        start = sh(f"{store(self.repo)} rev-parse {awa.RECORD_REF}", self.repo)
         (self.repo / "sub").mkdir()
         time.sleep(0.2)
         sh("echo hi > sub/new.txt && sed -i s/a/z/ a.txt", self.repo)
         self.assertTrue(wait_for(lambda: sh(
-            f"git rev-parse {awa.RECORD_REF}", self.repo) != start))
-        now = sh(f"git rev-parse {awa.RECORD_REF}", self.repo)
-        self.assertEqual(sh(f"git show {now}:sub/new.txt", self.repo), "hi")
-        self.assertEqual(sh(f"git show {now}:a.txt", self.repo), "z")
+            f"{store(self.repo)} rev-parse {awa.RECORD_REF}", self.repo) != start))
+        now = sh(f"{store(self.repo)} rev-parse {awa.RECORD_REF}", self.repo)
+        self.assertEqual(sh(f"{store(self.repo)} show {now}:sub/new.txt", self.repo), "hi")
+        self.assertEqual(sh(f"{store(self.repo)} show {now}:a.txt", self.repo), "z")
 
 
 class AwaIgnore(Base):
@@ -159,7 +199,8 @@ class AwaIgnore(Base):
            " && git add -A && git commit -qm vend", self.repo)
 
     def files(self, c):
-        return sh(f"git ls-tree -r --name-only {c}", self.repo).split()
+        return sh(f"{store(self.repo)} ls-tree -r --name-only {c}",
+                  self.repo).split()
 
     def watched(self, w):
         return set(w.wd_path.values())
@@ -172,7 +213,7 @@ class AwaIgnore(Base):
         files = self.files(c)
         self.assertNotIn("vend/new.txt", files)
         self.assertIn(".awaignore", files)
-        self.assertEqual(sh(f"git show {c}:vend/t.txt", self.repo), "t2")
+        self.assertEqual(sh(f"{store(self.repo)} show {c}:vend/t.txt", self.repo), "t2")
         # git itself doesn't see awa's rules
         self.assertIn("?? vend/new.txt", sh("git status --porcelain", self.repo))
 
@@ -236,9 +277,9 @@ class Tree(Base):
         return d
 
     def ref(self, d):
-        return subprocess.run(["git", "rev-parse", "-q", "--verify",
-                               awa.RECORD_REF], cwd=d, capture_output=True,
-                              text=True).stdout.strip()
+        return subprocess.run(["git", "--git-dir", str(awa.store_dir(d)),
+                               "rev-parse", "-q", "--verify", awa.RECORD_REF],
+                              capture_output=True, text=True).stdout.strip()
 
     def test_discover(self):
         nested = self.make_repo("group/inner")
@@ -351,9 +392,11 @@ class Workspaces(Base):
             tips.append(awa.snapshot(w1))
             (w1 / "note.txt").unlink()
             self.assertEqual(self.awa("rm", "w1"), 0)
-        kept = sh(f"git for-each-ref --format='%(objectname)' "
-                  f"{awa.RECORD_REF}-w1-*", self.repo).split()
+        kept = sh(f"{store(self.repo)} for-each-ref "
+                  f"--format='%(objectname)' {awa.RECORD_REF}-w1-*",
+                  self.repo).split()
         self.assertEqual(sorted(kept), sorted(tips))
+        self.assertFalse(awa.store_dir(w1).exists())
 
     def test_rm_refuses_unique_ignored_files_and_stale_branches(self):
         w1 = self.ws("w1")

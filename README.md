@@ -7,9 +7,10 @@ It does three things:
 
 - **Records every edit.** `awa record` watches a folder with inotify. When
   writes have been quiet for 2 s (or after at most 30 s of constant writes),
-  it commits the folder's state to the hidden ref `refs/awa/record`. It
-  catches every write (shell edits, formatters, scripts), not only an agent's
-  own edit tool. The agent's branch, index and HEAD are never touched. Each
+  it commits the folder's state to `refs/awa/record` in the repo's history
+  store (see below). It catches every write (shell edits, formatters,
+  scripts), not only an agent's own edit tool. The repo's branch, index,
+  HEAD, refs and objects are never touched. Each
   snapshot holds what `git add -A` would stage at that moment, so ignored
   files stay out. A missed event costs nothing: each snapshot commits whatever
   is on disk, and there is a safety snapshot every 5 minutes.
@@ -30,7 +31,8 @@ It does three things:
 ```bash
 awa record --start           # record this folder in the background (systemd user unit)
 awa record --stop
-git log refs/awa/record      # the edit history
+awa log                      # the edit history (git log arguments pass through)
+awa store                    # path of the history store
 awa record --tree ~/code --start   # record every repo under ~/code from one process
 
 awa new fix-auth --record    # isolated copy ../proj@fix-auth, recorded
@@ -41,7 +43,7 @@ awa rm fix-auth              # refuses if anything there isn't on a repo branch
 ```
 
 `-C PATH` acts on another repo. Only commits are merged: an agent's
-uncommitted work stays in its copy (and in that copy's `refs/awa/record`).
+uncommitted work stays in its copy (and in that copy's recorded history).
 `awa rm` refuses to delete a copy with uncommitted files, stashes, commits
 not on a branch of the repo, or ignored files the repo doesn't have (such
 as a new `.env`), unless you pass `--force`. Ignored files that exist in both
@@ -49,8 +51,20 @@ are deleted without comparing contents, and so is anything inside ignored
 dependency and build-cache folders (`node_modules`, `.venv`, `__pycache__`,
 `target`, `.next`, `.turbo`, `.cache`, `dist`, `build` and the like), which
 tools regenerate.
-It keeps the copy's edit history in the repo as
-`refs/awa/record-NAME-<timestamp>`.
+It keeps the copy's edit history in the repo's store as
+`refs/awa/record-NAME-<timestamp>`, then deletes the copy's store.
+
+## Where history is stored
+
+Each repo's history is a bare git repo at
+`~/.local/share/awa/<repo path below $HOME>.git` (`$XDG_DATA_HOME/awa/`),
+for example `~/code/proj` → `~/.local/share/awa/code/proj.git`. Repos
+outside `$HOME` go under `@abs/`. The store holds every object its history
+needs, so it survives the repo being deleted or recloned. Inspect it with
+`awa log`, or `git --git-dir "$(awa store)" show <commit>:<file>`.
+History that older versions kept in the repo itself (`refs/awa/record*`) is
+moved into the store on the next snapshot. A moved or renamed repo starts a
+new store at its new path; the old one stays where it was.
 
 ## Recording many repos
 
@@ -91,7 +105,7 @@ Tests: `python3 test_awa.py` (uses `~/.cache/awa-test`, or `AWA_TEST_DIR`).
 
 ## Limits
 
-- `refs/awa/record` grows without limit. It stores only changed files, but
+- The store grows without limit. It stores only changed files, but
   nothing prunes it.
 - A git worktree as the source repo is refused. Run awa from the main
   checkout.

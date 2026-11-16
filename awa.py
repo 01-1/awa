@@ -2,13 +2,15 @@
 """awa: Agents Work Apart.
 
 Workspaces for running several coding agents on one git repo:
-  record  Watch a folder with inotify and commit every change to a hidden ref
-          (refs/awa/record) without touching the branch, index or HEAD.
+  record  Watch a folder with inotify and commit every change to the ref
+          refs/awa/record of a bare repo in ~/.local/share/awa/, without
+          touching the folder's branch, index, HEAD, refs or objects.
           With --tree, one process records every repo under a folder.
   new     Make an isolated copy of a repo (btrfs reflink, instant) on its own
           branch awa/<name>, at <repo>@<name>.
   merge   Merge a copy's branch and run a test in a temporary copy, then
           fast-forward the repo; bring the copy up to date.
+  log     Show a repo's recorded history (git log arguments pass through).
 
 Standard library only. Linux only (inotify via ctypes).
 """
@@ -177,18 +179,103 @@ def skipped_dirs(repo, dirs, excl):
 
 # ---------------------------------------------------------------- recording
 
+def data_home():
+    return Path(os.environ.get("XDG_DATA_HOME")
+                or Path.home() / ".local" / "share")
+
+
+def store_dir(repo):
+    """The bare repo holding repo's edit history.
+
+    ~/.local/share/awa/<repo path below $HOME>.git, or under @abs/ for a
+    repo outside $HOME, so the history survives the repo being deleted.
+    """
+    repo = Path(os.path.realpath(repo))
+    home = Path(os.path.realpath(Path.home()))
+    if repo == home:
+        rel = "@home"
+    elif repo.is_relative_to(home):
+        rel = str(repo.relative_to(home))
+    else:
+        rel = "@abs/" + str(repo.relative_to("/"))
+    return data_home() / "awa" / (rel + ".git")
+
+
+def open_store(repo):
+    """Create repo's store if needed, move in any history still kept in the
+    repo itself (refs/awa/record*, from older versions of awa), and return
+    the store's path."""
+    st = store_dir(repo)
+    if not (st / "HEAD").exists():
+        st.parent.mkdir(parents=True, exist_ok=True)
+        tmp = st.with_name(f"{st.name}.tmp{os.getpid()}")
+        shutil.rmtree(tmp, ignore_errors=True)
+        git("init", "-q", "--bare", str(tmp), cwd="/")
+        git("config", "awa.path", str(os.path.realpath(repo)), cwd=tmp)
+        try:
+            os.rename(tmp, st)
+        except OSError:  # another recorder made it first
+            shutil.rmtree(tmp, ignore_errors=True)
+            if not (st / "HEAD").exists():
+                raise
+    old = git("for-each-ref", "--format=%(objectname) %(refname)",
+              RECORD_REF, f"{RECORD_REF}-*", cwd=repo).stdout.split("\n")
+    for line in filter(None, old):
+        sha, ref = line.split(" ", 1)
+        have = git("--git-dir", str(st), "rev-parse", "-q", "--verify", ref,
+                   cwd="/", check=False).stdout.strip()
+        dest = ref
+        if have and have != sha:
+            dest = f"{ref}-imported-{time.strftime('%Y%m%dT%H%M%S')}-{sha[:8]}"
+        if have != sha:
+            git("--git-dir", str(st), "fetch", "-q", str(repo),
+                f"+{ref}:{dest}", cwd="/")
+        git("update-ref", "-d", ref, sha, cwd=repo)
+    return st
+
+
+def copy_missing(repo, st, commit, prev, env):
+    """Copy into the store the objects of commit (not in prev) that only the
+    repo has, so the store never depends on the repo's objects."""
+    objs = git("rev-list", "--objects", commit, *(["--not", prev] if prev
+               else []), cwd=repo, env=env).stdout.split("\n")
+    shas = "".join(o.split(" ", 1)[0] + "\n" for o in objs if o)
+    r = git("--git-dir", str(st), "cat-file", "--batch-check", cwd="/",
+            input=shas)
+    missing = [x.split()[0] for x in r.stdout.splitlines()
+               if x.endswith(" missing")]
+    if not missing:
+        return
+    pack = subprocess.run(["git", "pack-objects", "--stdout", "-q"], cwd=repo,
+                          input=("\n".join(missing) + "\n").encode(),
+                          capture_output=True)
+    if pack.returncode != 0:
+        raise RuntimeError(f"git pack-objects failed in {repo}: "
+                           f"{pack.stderr.decode(errors='replace').strip()}")
+    cmd = ["unpack-objects", "-q"] if len(missing) < 1000 else [
+        "index-pack", "--stdin"]
+    r = subprocess.run(["git", "--git-dir", str(st), *cmd], input=pack.stdout,
+                       capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"git {cmd[0]} failed in {st}: "
+                           f"{r.stderr.decode(errors='replace').strip()}")
+
+
 def snapshot(repo, reason="change"):
-    """Commit the folder's current state to RECORD_REF if it changed.
+    """Commit the folder's current state to RECORD_REF in its store if it
+    changed.
 
     The private index starts each time as a copy of the real index, so the
     snapshot holds exactly what `git add -A` would stage now: tracked files
     (even ones matching an ignore rule) plus untracked files that aren't
     ignored, where awa's own rules (.awaignore, ~/.config/awa/ignore) count
-    as ignore rules. The agent's own index and HEAD are never touched.
+    as ignore rules. New objects go straight into the store; the agent's own
+    index, HEAD, refs and objects are never touched.
     Returns the new commit id, or None when nothing changed.
     """
     gd = git_dir(repo)
     excl = excludes_file(repo, gd)
+    st = open_store(repo)
     (gd / "awa").mkdir(exist_ok=True)
     priv = gd / "awa" / "index"
     real = gd / "index"
@@ -198,18 +285,22 @@ def snapshot(repo, reason="change"):
         os.replace(tmp, priv)
     elif priv.exists():
         priv.unlink()
-    env = {"GIT_INDEX_FILE": str(priv)}
+    # Write to the store's objects; read the repo's too (the index names them).
+    env = {"GIT_INDEX_FILE": str(priv),
+           "GIT_OBJECT_DIRECTORY": str(st / "objects"),
+           "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(gd / "objects")}
     git("-c", f"core.excludesFile={excl}", "add", "-A", "--", ".", cwd=repo,
         env=env)
     tree = git("write-tree", cwd=repo, env=env).stdout.strip()
-    prev = git("rev-parse", "-q", "--verify", RECORD_REF + "^{commit}",
-               cwd=repo, check=False).stdout.strip()
+    prev = git("--git-dir", str(st), "rev-parse", "-q", "--verify",
+               RECORD_REF + "^{commit}", cwd="/", check=False).stdout.strip()
     if prev:
-        prev_tree = git("rev-parse", prev + "^{tree}", cwd=repo).stdout.strip()
+        prev_tree = git("--git-dir", str(st), "rev-parse", prev + "^{tree}",
+                        cwd="/").stdout.strip()
         if prev_tree == tree:
             return None
         changed = git("diff-tree", "-r", "--name-status", prev_tree, tree,
-                      cwd=repo).stdout.strip()
+                      cwd=repo, env=env).stdout.strip()
     else:
         changed = "(first snapshot)"
     lines = changed.splitlines()
@@ -223,10 +314,12 @@ def snapshot(repo, reason="change"):
            "GIT_COMMITTER_NAME": "awa-recorder",
            "GIT_COMMITTER_EMAIL": "awa@localhost"}
     args = ["commit-tree", tree] + (["-p", prev] if prev else [])
-    commit = git(*args, cwd=repo, env=who, input=msg).stdout.strip()
+    commit = git(*args, cwd=repo, env={**env, **who}, input=msg).stdout.strip()
+    copy_missing(repo, st, commit, prev, env)
     # Compare-and-swap so two recorders on one repo can't lose a snapshot.
-    git("update-ref", "-m", "awa record", RECORD_REF, commit,
-        prev or "0" * 40, cwd=repo)
+    git("--git-dir", str(st), "update-ref", "-m", "awa record", RECORD_REF,
+        commit, prev or "0" * 40, cwd="/")
+    git("--git-dir", str(st), "gc", "--auto", "--quiet", cwd="/", check=False)
     return commit
 
 
@@ -407,7 +500,7 @@ class Recorder:
 def record_loop(repo, once=False):
     repo = toplevel(repo)
     first = snapshot(repo, "start")
-    print(f"awa: recording {repo} to {RECORD_REF}"
+    print(f"awa: recording {repo} to {RECORD_REF} in {store_dir(repo)}"
           + (f" (snapshot {first[:10]})" if first else ""), flush=True)
     if once:
         return
@@ -844,16 +937,20 @@ def ws_rm(repo, name, force):
             die(f"not removing {dest}: {why}. Merge first, or use --force")
     if is_recording(dest):
         record_stop(dest)
-    # Keep the copy's edit history in the repo.
-    if git("rev-parse", "-q", "--verify", RECORD_REF, cwd=dest,
-           check=False).returncode == 0:
+    # Keep the copy's edit history in the repo's store.
+    src = open_store(dest)
+    st = open_store(repo)
+    if git("--git-dir", str(src), "rev-parse", "-q", "--verify", RECORD_REF,
+           cwd="/", check=False).returncode == 0:
         kept = f"{RECORD_REF}-{name}-{time.strftime('%Y%m%dT%H%M%S')}"
-        while git("rev-parse", "-q", "--verify", kept, cwd=repo,
-                  check=False).returncode == 0:
+        while git("--git-dir", str(st), "rev-parse", "-q", "--verify", kept,
+                  cwd="/", check=False).returncode == 0:
             kept += "x"
-        git("fetch", "-q", str(dest), f"{RECORD_REF}:{kept}", cwd=repo)
-        print(f"awa: kept its edit history as {kept}")
+        git("--git-dir", str(st), "fetch", "-q", str(src),
+            f"{RECORD_REF}:{kept}", cwd="/")
+        print(f"awa: kept its edit history as {kept} in {st}")
     shutil.rmtree(dest)
+    shutil.rmtree(src, ignore_errors=True)
     git("update-ref", "-d", f"refs/awa/incoming/{name}", cwd=repo, check=False)
     print(f"awa: removed {dest}")
 
@@ -891,7 +988,8 @@ def main(argv=None):
                    help="repo to act on (default: current folder)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    r = sub.add_parser("record", help="record every edit to refs/awa/record")
+    r = sub.add_parser("record", help="record every edit to refs/awa/record "
+                       "in ~/.local/share/awa/<repo>.git")
     r.add_argument("path", nargs="?", default=None)
     g = r.add_mutually_exclusive_group()
     g.add_argument("--start", action="store_true", help="run in the background")
@@ -915,11 +1013,18 @@ def main(argv=None):
 
     sub.add_parser("list", help="list copies")
 
+    sub.add_parser("log", help="show the recorded edit history; other "
+                   "arguments go to git log (default ref: refs/awa/record)")
+
+    sub.add_parser("store", help="print the path of the repo's history store")
+
     d = sub.add_parser("rm", help="delete a copy whose work is all merged")
     d.add_argument("name")
     d.add_argument("--force", action="store_true")
 
-    a = p.parse_args(argv)
+    a, extra = p.parse_known_args(argv)
+    if extra and a.cmd != "log":
+        p.error(f"unrecognized arguments: {' '.join(extra)}")
     try:
         if a.cmd == "record":
             path = a.path or a.repo
@@ -942,6 +1047,14 @@ def main(argv=None):
             ws_list(a.repo)
         elif a.cmd == "rm":
             ws_rm(a.repo, a.name, a.force)
+        elif a.cmd == "store":
+            print(open_store(toplevel(a.repo)))
+        elif a.cmd == "log":
+            st = open_store(toplevel(a.repo))
+            return subprocess.run(["git", "--git-dir", str(st), "log",
+                                   *extra, *([] if any(not x.startswith("-")
+                                   for x in extra) else [RECORD_REF])
+                                   ]).returncode
     except RuntimeError as e:
         die(str(e))
     except KeyboardInterrupt:
