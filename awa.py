@@ -229,9 +229,21 @@ def open_store(repo):
         dest = ref
         if have and have != sha:
             dest = f"{ref}-imported-{time.strftime('%Y%m%dT%H%M%S')}-{sha[:8]}"
-        if have != sha:  # not forced: never overwrite what is there now
+        if have != sha:
+            # Fetch to a private ref, then install it only if dest is still
+            # what we saw, so a concurrent snapshot is never overwritten.
+            tmp = f"refs/awa/tmp/{os.getpid()}-{sha[:8]}"
             git("--git-dir", str(st), "fetch", "-q", str(repo),
-                f"{ref}:{dest}", cwd="/")
+                f"+{sha}:{tmp}", cwd="/",
+                env={"GIT_CONFIG_COUNT": "1",  # fetch the object by id
+                     "GIT_CONFIG_KEY_0": "uploadpack.allowAnySHA1InWant",
+                     "GIT_CONFIG_VALUE_0": "true"})
+            try:
+                git("--git-dir", str(st), "update-ref", dest, sha,
+                    have if dest == ref else "0" * 40, cwd="/")
+            finally:
+                git("--git-dir", str(st), "update-ref", "-d", tmp, cwd="/",
+                    check=False)
         git("update-ref", "-d", ref, sha, cwd=repo)
     return st
 
