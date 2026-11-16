@@ -31,7 +31,7 @@ It does three things:
 ```bash
 awa record --start           # record this folder in the background (systemd user unit)
 awa record --stop
-awa log                      # the edit history (git log arguments pass through)
+awa log --stat                 # the edit history (git log refs/awa/record ARGS)
 awa store                    # path of the history store
 awa record --tree ~/code --start   # record every repo under ~/code from one process
 

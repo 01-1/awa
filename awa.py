@@ -229,9 +229,9 @@ def open_store(repo):
         dest = ref
         if have and have != sha:
             dest = f"{ref}-imported-{time.strftime('%Y%m%dT%H%M%S')}-{sha[:8]}"
-        if have != sha:
+        if have != sha:  # not forced: never overwrite what is there now
             git("--git-dir", str(st), "fetch", "-q", str(repo),
-                f"+{ref}:{dest}", cwd="/")
+                f"{ref}:{dest}", cwd="/")
         git("update-ref", "-d", ref, sha, cwd=repo)
     return st
 
@@ -945,14 +945,15 @@ def ws_rm(repo, name, force):
     # Keep the copy's edit history in the repo's store.
     src = open_store(dest)
     st = open_store(repo)
-    if git("--git-dir", str(src), "rev-parse", "-q", "--verify", RECORD_REF,
-           cwd="/", check=False).returncode == 0:
+    refs = git("--git-dir", str(src), "for-each-ref", "--format=%(refname)",
+               RECORD_REF, f"{RECORD_REF}-*", cwd="/").stdout.split()
+    if refs:
         kept = f"{RECORD_REF}-{name}-{time.strftime('%Y%m%dT%H%M%S')}"
-        while git("--git-dir", str(st), "rev-parse", "-q", "--verify", kept,
-                  cwd="/", check=False).returncode == 0:
+        while git("--git-dir", str(st), "for-each-ref", f"{kept}", f"{kept}-*",
+                  cwd="/").stdout.strip():
             kept += "x"
         git("--git-dir", str(st), "fetch", "-q", str(src),
-            f"{RECORD_REF}:{kept}", cwd="/")
+            *[f"{r}:{kept}{r[len(RECORD_REF):]}" for r in refs], cwd="/")
         print(f"awa: kept its edit history as {kept} in {st}")
     shutil.rmtree(dest)
     shutil.rmtree(src, ignore_errors=True)
@@ -1165,8 +1166,8 @@ def main(argv=None):
 
     sub.add_parser("list", help="list copies")
 
-    sub.add_parser("log", help="show the recorded edit history; other "
-                   "arguments go to git log (default ref: refs/awa/record)")
+    sub.add_parser("log", help="git log refs/awa/record in the repo's store; "
+                   "other arguments go to git log")
 
     sub.add_parser("store", help="print the path of the repo's history store")
 
@@ -1212,9 +1213,7 @@ def main(argv=None):
         elif a.cmd == "log":
             st = open_store(toplevel(a.repo))
             return subprocess.run(["git", "--git-dir", str(st), "log",
-                                   *extra, *([] if any(not x.startswith("-")
-                                   for x in extra) else [RECORD_REF])
-                                   ]).returncode
+                                   RECORD_REF, *extra]).returncode
     except RuntimeError as e:
         die(str(e))
     except KeyboardInterrupt:

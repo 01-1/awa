@@ -463,6 +463,17 @@ class Workspaces(Base):
         self.assertEqual(sorted(kept), sorted(tips))
         self.assertFalse(awa.store_dir(w1).exists())
 
+    def test_rm_keeps_imported_histories_too(self):
+        w1 = self.ws("w1")
+        side = sh(f"echo side | git commit-tree {sh('git write-tree', w1)}", w1)
+        st = awa.open_store(w1)
+        sh(f"git --git-dir={st} fetch -q {w1} {side}:refs/awa/record-side", w1)
+        awa.snapshot(w1)
+        self.assertEqual(self.awa("rm", "w1"), 0)
+        kept = sh(f"{store(self.repo)} for-each-ref --format='%(objectname)' "
+                  f"'{awa.RECORD_REF}-w1-*-side'", self.repo)
+        self.assertEqual(kept, side)
+
     def test_rm_refuses_unique_ignored_files_and_stale_branches(self):
         w1 = self.ws("w1")
         (w1 / "secret.log").write_text("s\n")
