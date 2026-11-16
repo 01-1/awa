@@ -23,6 +23,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -97,19 +98,41 @@ def excludes_file(repo, gd=None):
         try:
             parts.append(Path(f).read_text(errors="replace"))
         except OSError:
-            pass
-    text = "\n".join(parts) + "\n"
+            parts.append("")
     (gd / "awa").mkdir(exist_ok=True)
     out = gd / "awa" / "excludes"
+    _write_if_changed(out, "\n".join(parts) + "\n")
+    # awa's rules alone, beside it: see awa_matches
+    _write_if_changed(out.with_name("awa-rules"), "\n".join(parts[1:]) + "\n")
+    return out
+
+
+def _write_if_changed(path, text):
     try:
-        if out.read_text(errors="replace") == text:
-            return out
+        if path.read_text(errors="replace") == text:
+            return
     except OSError:
         pass
-    tmp = out.with_name("excludes.tmp")
+    tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text)
-    os.replace(tmp, out)
-    return out
+    os.replace(tmp, path)
+
+
+def awa_matches(rels, excl):
+    """Paths among rels (relative folders) that awa's own rules match,
+    whatever the repo's .gitignore files say: checked in an empty scratch
+    repo holding just those folders."""
+    rules = Path(excl).with_name("awa-rules")
+    try:
+        if not rules.read_text(errors="replace").strip() or not rels:
+            return set()
+    except OSError:
+        return set()
+    with tempfile.TemporaryDirectory(prefix="awa-rules-") as t:
+        git("init", "-q", cwd=t)
+        for r in rels:
+            os.makedirs(os.path.join(t, r), exist_ok=True)
+        return check_ignore(t, list(rels), rules)
 
 
 def check_ignore(repo, rels, excl=None):
@@ -135,11 +158,8 @@ def skipped_dirs(repo, dirs, excl):
     """
     repo = str(repo)
     rel = {os.path.relpath(d, repo): d for d in dirs}
-    matched = check_ignore(repo, list(rel), excl)
-    if not matched:
-        return set()
-    by_git = check_ignore(repo, sorted(matched))
-    skip = matched - by_git
+    skip = awa_matches(list(rel), excl)
+    by_git = check_ignore(repo, [x for x in rel if x not in skip])
     if by_git:
         tracked = git("ls-files", "-c", "-z", "--", *sorted(by_git),
                       cwd=repo, check=False,
@@ -392,16 +412,29 @@ def record_loop(repo, once=False):
     if once:
         return
     r = Recorder(repo)
+    rules = rules_stamp()
     while True:
         if r.gone():
             print(f"awa: {repo} is gone; stopping", flush=True)
             return
+        if rules_stamp() != rules:  # ~/.config/awa/ignore changed
+            rules = rules_stamp()
+            r.watcher.rescan()
         timeout = max(0.0, r.deadline() - time.monotonic())
         ready, _, _ = select.select([r.watcher.fd], [], [], min(timeout, 10.0))
         now = time.monotonic()
         if ready:
             r.on_ready(now)
         r.maybe_snapshot(now)
+
+
+def rules_stamp():
+    """Changes when ~/.config/awa/ignore does."""
+    try:
+        st = os.stat(global_awaignore())
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return None
 
 
 def discover(root, depth=TREE_DEPTH):
@@ -445,16 +478,7 @@ def record_tree(root, once=False, stop=None):
     if not os.path.isdir(root):
         die(f"{root} is not a folder")
     recs = {}
-    gaw = global_awaignore()
-
-    def stamp():
-        try:
-            st = os.stat(gaw)
-            return (st.st_mtime_ns, st.st_size)
-        except OSError:
-            return None
-
-    rules = stamp()
+    rules = rules_stamp()
     next_scan = 0.0
     while stop is None or not stop.is_set():
         now = time.monotonic()
@@ -486,8 +510,8 @@ def record_tree(root, once=False, stop=None):
             if len(recs) != before:
                 print(f"awa: recording {len(recs)} repos under {root}",
                       flush=True)
-            if stamp() != rules:  # ~/.config/awa/ignore changed
-                rules = stamp()
+            if rules_stamp() != rules:  # ~/.config/awa/ignore changed
+                rules = rules_stamp()
                 for d, r in list(recs.items()):
                     try:
                         r.watcher.rescan()

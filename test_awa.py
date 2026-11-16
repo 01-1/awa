@@ -206,6 +206,15 @@ class AwaIgnore(Base):
         finally:
             w.close()
 
+    def test_dir_matched_by_both_rule_files_is_skipped(self):
+        sh("echo 'vend/' >> .gitignore && git commit -qam g", self.repo)
+        (self.repo / ".awaignore").write_text("vend/\n")
+        w = awa.Watcher(self.repo)
+        try:
+            self.assertNotIn(str(self.repo / "vend"), self.watched(w))
+        finally:
+            w.close()
+
     def test_gitignored_dir_holding_tracked_files_is_watched(self):
         sh("echo 'gen/' >> .gitignore && mkdir -p gen/in && echo g > gen/g.txt"
            " && git add -f gen/g.txt .gitignore && git commit -qm g", self.repo)
