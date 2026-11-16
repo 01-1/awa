@@ -36,6 +36,7 @@ class Base(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(dir=BASE))
         self.repo = self.tmp / "proj"
         self.repo.mkdir()
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "config")
         for k in ("AUTHOR", "COMMITTER"):
             os.environ[f"GIT_{k}_NAME"] = "t"
             os.environ[f"GIT_{k}_EMAIL"] = "t@t"
@@ -149,6 +150,125 @@ class Recording(Base):
         now = sh(f"git rev-parse {awa.RECORD_REF}", self.repo)
         self.assertEqual(sh(f"git show {now}:sub/new.txt", self.repo), "hi")
         self.assertEqual(sh(f"git show {now}:a.txt", self.repo), "z")
+
+
+class AwaIgnore(Base):
+    def setUp(self):
+        super().setUp()
+        sh("mkdir -p vend/sub && echo t > vend/t.txt && echo s > vend/sub/s.txt"
+           " && git add -A && git commit -qm vend", self.repo)
+
+    def files(self, c):
+        return sh(f"git ls-tree -r --name-only {c}", self.repo).split()
+
+    def watched(self, w):
+        return set(w.wd_path.values())
+
+    def test_snapshot_drops_untracked_keeps_tracked(self):
+        (self.repo / ".awaignore").write_text("vend/\n")
+        (self.repo / "vend" / "new.txt").write_text("n\n")
+        (self.repo / "vend" / "t.txt").write_text("t2\n")
+        c = awa.snapshot(self.repo)
+        files = self.files(c)
+        self.assertNotIn("vend/new.txt", files)
+        self.assertIn(".awaignore", files)
+        self.assertEqual(sh(f"git show {c}:vend/t.txt", self.repo), "t2")
+        # git itself doesn't see awa's rules
+        self.assertIn("?? vend/new.txt", sh("git status --porcelain", self.repo))
+
+    def test_global_rules(self):
+        cfg = Path(os.environ["XDG_CONFIG_HOME"]) / "awa"
+        cfg.mkdir(parents=True)
+        (cfg / "ignore").write_text("scratch/\n")
+        (self.repo / "scratch").mkdir()
+        (self.repo / "scratch" / "x").write_text("x")
+        self.assertNotIn("scratch/x", self.files(awa.snapshot(self.repo)))
+
+    def test_gitignore_can_reinclude(self):
+        (self.repo / ".awaignore").write_text("*.tmp\n")
+        sh("echo '!keep.tmp' >> .gitignore", self.repo)
+        (self.repo / "keep.tmp").write_text("k")
+        (self.repo / "drop.tmp").write_text("d")
+        files = self.files(awa.snapshot(self.repo))
+        self.assertIn("keep.tmp", files)
+        self.assertNotIn("drop.tmp", files)
+
+    def test_watcher_skips_matched_dirs_even_if_tracked(self):
+        (self.repo / ".awaignore").write_text("vend/\n")
+        w = awa.Watcher(self.repo)
+        try:
+            self.assertIn(str(self.repo), self.watched(w))
+            self.assertNotIn(str(self.repo / "vend"), self.watched(w))
+            self.assertNotIn(str(self.repo / "vend" / "sub"), self.watched(w))
+            (self.repo / ".awaignore").write_text("")
+            self.assertTrue(wait_for(lambda: w.read(), 2.0))
+            self.assertIn(str(self.repo / "vend" / "sub"), self.watched(w))
+        finally:
+            w.close()
+
+    def test_gitignored_dir_holding_tracked_files_is_watched(self):
+        sh("echo 'gen/' >> .gitignore && mkdir -p gen/in && echo g > gen/g.txt"
+           " && git add -f gen/g.txt .gitignore && git commit -qm g", self.repo)
+        (self.repo / "node_modules" / "pkg").mkdir(parents=True)
+        w = awa.Watcher(self.repo)
+        try:
+            self.assertIn(str(self.repo / "gen"), self.watched(w))
+            self.assertNotIn(str(self.repo / "node_modules"), self.watched(w))
+        finally:
+            w.close()
+
+
+class Tree(Base):
+    def make_repo(self, rel):
+        d = self.tmp / rel
+        d.mkdir(parents=True)
+        sh("git init -q -b main && echo a > a.txt && git add -A && "
+           "git commit -qm init", d)
+        return d
+
+    def ref(self, d):
+        return subprocess.run(["git", "rev-parse", "-q", "--verify",
+                               awa.RECORD_REF], cwd=d, capture_output=True,
+                              text=True).stdout.strip()
+
+    def test_discover(self):
+        nested = self.make_repo("group/inner")
+        self.make_repo("a/b/c/d/e")  # deeper than TREE_DEPTH
+        self.make_repo("proj/node_modules/pkg")  # dependency folder
+        off = self.make_repo("off")
+        (off / ".git" / awa.NORECORD).touch()
+        sh("git worktree add -q ../wt", self.repo)  # worktrees are refused
+        found = set(awa.discover(self.tmp))
+        self.assertEqual(found, {os.path.realpath(self.repo),
+                                 os.path.realpath(nested)})
+
+    def test_records_every_repo_in_one_process(self):
+        quiet, again = awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS
+        awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS = 0.3, 0.5
+        other = self.make_repo("other")
+        stop = threading.Event()
+        t = threading.Thread(target=awa.record_tree, args=(self.tmp,),
+                             kwargs={"stop": stop}, daemon=True)
+        t.start()
+        try:
+            self.assertTrue(wait_for(lambda: self.ref(self.repo)
+                                     and self.ref(other)))
+            first = self.ref(self.repo), self.ref(other)
+            (self.repo / "x.txt").write_text("x")
+            (other / "y.txt").write_text("y")
+            self.assertTrue(wait_for(lambda: self.ref(self.repo) != first[0]
+                                     and self.ref(other) != first[1]))
+            late = self.make_repo("late")  # appears after the start
+            self.assertTrue(wait_for(lambda: self.ref(late)))
+            time.sleep(0.3)
+            start = self.ref(late)
+            (late / "z.txt").write_text("z")
+            self.assertTrue(wait_for(lambda: self.ref(late) != start))
+        finally:
+            stop.set()
+            t.join(15)
+            awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS = quiet, again
+        self.assertFalse(t.is_alive())
 
 
 class Workspaces(Base):
