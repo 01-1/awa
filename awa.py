@@ -462,10 +462,10 @@ def record_tree(root, once=False, stop=None):
             next_scan = now + REDISCOVER_SECONDS
             busy = recording_units()
             want = [d for d in discover(root) if unit_name(Path(d)) not in busy]
+            before = len(recs)
             for d in [d for d in recs if d not in want]:
                 recs.pop(d).watcher.close()
                 print(f"awa: {d}: no longer recorded here", flush=True)
-            before = len(recs)
             for d in want:
                 if d in recs:
                     continue
