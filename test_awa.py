@@ -43,6 +43,8 @@ class Base(unittest.TestCase):
         self.repo.mkdir()
         os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "config")
         os.environ["XDG_DATA_HOME"] = str(self.tmp / "data")
+        os.environ["XDG_CACHE_HOME"] = str(self.tmp / "cache")
+        os.environ["AWA_NO_AUTO_UPDATE"] = "1"  # never update the real awa
         for k in ("AUTHOR", "COMMITTER"):
             os.environ[f"GIT_{k}_NAME"] = "t"
             os.environ[f"GIT_{k}_EMAIL"] = "t@t"
@@ -319,6 +321,69 @@ class Tree(Base):
             t.join(15)
             awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS = quiet, again
         self.assertFalse(t.is_alive())
+
+
+class Update(Base):
+    def setUp(self):
+        super().setUp()
+        sh("git clone -q --bare proj up.git && git clone -q up.git inst "
+           "&& git clone -q up.git dev", self.tmp)
+        self.inst, self.dev = self.tmp / "inst", self.tmp / "dev"
+
+    def publish(self, text):
+        sh(f"echo {text} > a.txt && git commit -qam {text} && git push -q",
+           self.dev)
+
+    def test_fast_forwards_to_upstream(self):
+        self.publish("v2")
+        self.assertTrue(awa.self_update(self.inst, quiet=True))
+        self.assertEqual((self.inst / "a.txt").read_text(), "v2\n")
+        self.assertFalse(awa.self_update(self.inst, quiet=True))  # current
+
+    def test_leaves_local_changes_and_commits(self):
+        self.publish("v2")
+        (self.inst / "a.txt").write_text("mine\n")
+        self.assertFalse(awa.self_update(self.inst, quiet=True))
+        self.assertEqual((self.inst / "a.txt").read_text(), "mine\n")
+        sh("git commit -qam mine", self.inst)  # now diverged
+        self.assertFalse(awa.self_update(self.inst, quiet=True))
+        self.assertEqual(sh("git log -1 --format=%s", self.inst), "mine")
+
+    def test_recorder_restarts_after_another_process_updates(self):
+        del os.environ["AWA_NO_AUTO_UPDATE"]
+        execs = []
+        saved = awa.awa_checkout, awa.os.execv, dict(awa._running)
+        awa.awa_checkout = lambda: self.inst
+        awa.os.execv = lambda *a: execs.append(a)
+        try:
+            awa._running.update(head=None, next=0.0)
+            awa.maybe_reexec()  # nothing new: keeps running
+            self.assertEqual(execs, [])
+            self.publish("v2")
+            self.assertTrue(awa.self_update(self.inst, quiet=True))  # `awa x`
+            awa._running["next"] = 0.0  # a day later
+            awa.maybe_reexec()
+            self.assertEqual(len(execs), 1)
+        finally:
+            awa.awa_checkout, awa.os.execv = saved[:2]
+            awa._running.update(saved[2])
+            os.environ["AWA_NO_AUTO_UPDATE"] = "1"
+
+    def test_due_once_a_day_and_opt_out(self):
+        del os.environ["AWA_NO_AUTO_UPDATE"]
+        try:
+            self.assertTrue(awa.update_due())
+            awa.self_update(self.inst, quiet=True)  # records the check
+            self.assertFalse(awa.update_due())
+            old = time.time() - awa.UPDATE_SECONDS - 1
+            os.utime(awa.update_stamp(), (old, old))
+            self.assertTrue(awa.update_due())
+            off = self.tmp / "config" / "awa" / "no-auto-update"
+            off.parent.mkdir(parents=True, exist_ok=True)
+            off.touch()
+            self.assertFalse(awa.update_due())
+        finally:
+            os.environ["AWA_NO_AUTO_UPDATE"] = "1"
 
 
 class Workspaces(Base):

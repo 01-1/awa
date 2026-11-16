@@ -18,6 +18,7 @@ import argparse
 import ctypes
 import ctypes.util
 import errno
+import fcntl
 import hashlib
 import os
 import select
@@ -34,6 +35,7 @@ QUIET_SECONDS = 2.0     # commit after writes have been quiet this long
 MAX_DELAY = 30.0        # but never wait longer than this during a burst
 SAFETY_SECONDS = 300.0  # snapshot at least this often, in case events were lost
 REDISCOVER_SECONDS = 60.0  # --tree: look for new or removed repos this often
+UPDATE_SECONDS = 86400.0  # auto-update: check for a new awa this often
 TREE_DEPTH = 4          # --tree: how deep below the folder to look for repos
 AWAIGNORE = ".awaignore"   # per-repo rules, gitignore syntax
 NORECORD = "awa-norecord"  # <git dir>/awa-norecord: --tree skips the repo
@@ -507,6 +509,7 @@ def record_loop(repo, once=False):
     r = Recorder(repo)
     rules = rules_stamp()
     while True:
+        maybe_reexec()
         if r.gone():
             print(f"awa: {repo} is gone; stopping", flush=True)
             return
@@ -576,6 +579,8 @@ def record_tree(root, once=False, stop=None):
     while stop is None or not stop.is_set():
         now = time.monotonic()
         if now >= next_scan:
+            if not once:
+                maybe_reexec()
             next_scan = now + REDISCOVER_SECONDS
             busy = recording_units()
             want = [d for d in discover(root) if unit_name(Path(d)) not in busy]
@@ -978,6 +983,153 @@ def ws_list(repo):
         print("awa: no workspaces")
 
 
+# ---------------------------------------------------------------- updates
+
+def awa_checkout():
+    """The git checkout awa.py runs from (through any symlink)."""
+    return Path(os.path.realpath(__file__)).parent
+
+
+def auto_update_enabled():
+    """On unless AWA_NO_AUTO_UPDATE is set or ~/.config/awa/no-auto-update
+    exists."""
+    return not (os.environ.get("AWA_NO_AUTO_UPDATE")
+                or (config_home() / "awa" / "no-auto-update").exists())
+
+
+def update_stamp():
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return cache / "awa" / "last-update-check"
+
+
+def update_due():
+    """Whether auto-update should check now; at most once per UPDATE_SECONDS
+    across all awa processes."""
+    if not auto_update_enabled():
+        return False
+    try:
+        return time.time() - update_stamp().stat().st_mtime >= UPDATE_SECONDS
+    except OSError:
+        return True
+
+
+def self_update(src=None, quiet=False, auto=False):
+    """Fast-forward awa's checkout to its upstream branch.
+
+    Leaves it alone when tracked files have local changes, when it isn't on
+    a branch with an upstream, or when it has commits the upstream lacks.
+    One update runs at a time; with auto, only when one is due.
+    Returns True when the checkout moved to a new commit.
+    """
+    src = Path(src or awa_checkout())
+    say = (lambda m: None) if quiet else (lambda m: print(f"awa: {m}",
+                                                          flush=True))
+    p = update_stamp()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(p.with_name("update.lock"), "w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        say("not updating: another update is running")
+        return False
+    with lock:
+        if auto and not update_due():
+            return False
+        try:
+            p.touch()
+        except OSError:
+            pass
+        return _ff_checkout(src, say)
+
+
+def _ff_checkout(src, say):
+    env = {"GIT_TERMINAL_PROMPT": "0"}
+    if "GIT_SSH_COMMAND" not in os.environ:
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+
+    def run(*args, timeout=30):
+        return subprocess.run(["git", *args], cwd=src, capture_output=True,
+                              text=True, timeout=timeout,
+                              env={**os.environ, **env})
+    try:
+        if run("rev-parse", "--is-inside-work-tree").returncode != 0:
+            say(f"not updating: {src} is not a git checkout")
+            return False
+        if run("rev-parse", "--abbrev-ref", "@{u}").returncode != 0:
+            say(f"not updating: {src} has no upstream branch")
+            return False
+        if run("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            say(f"not updating: {src} has local changes")
+            return False
+        old = run("rev-parse", "HEAD").stdout.strip()
+        f = run("fetch", "--quiet", timeout=120)
+        if f.returncode != 0:
+            say(f"update check failed: {f.stderr.strip()}")
+            return False
+        m = run("merge", "--ff-only", "--quiet", "@{u}")
+        if m.returncode != 0:
+            say(f"not updating: {src} has commits its upstream lacks")
+            return False
+        new = run("rev-parse", "HEAD").stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        say(f"update check failed: {e}")
+        return False
+    if new == old:
+        say("awa is up to date")
+        return False
+    print(f"awa: updated {old[:10]} -> {new[:10]}", flush=True)
+    return True
+
+
+def checkout_head():
+    r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=awa_checkout(),
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+_running = {"head": None, "next": 0.0}  # this recorder's code and next check
+
+
+def maybe_reexec():
+    """In a long-running recorder, once a day: auto-update if due, and
+    restart on the new code if the checkout moved to another commit (by
+    this or any other awa process) and it compiles. A restart loses
+    nothing: the recorder snapshots every repo when it starts."""
+    now = time.monotonic()
+    if _running["head"] is None:
+        _running["head"] = checkout_head()
+    if now < _running["next"] or not auto_update_enabled():
+        return
+    _running["next"] = now + UPDATE_SECONDS
+    self_update(quiet=True, auto=True)
+    head = checkout_head()
+    if head is None or head == _running["head"]:
+        return
+    me = os.path.realpath(__file__)
+    r = subprocess.run([sys.executable, "-m", "py_compile", me],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"awa: new version does not compile; still running the old "
+              f"one: {r.stderr.strip()}", flush=True)
+        return
+    print("awa: restarting on the new version", flush=True)
+    os.execv(sys.executable, [sys.executable, me, *sys.argv[1:]])
+
+
+def background_update():
+    """From a short command: check for an update in a detached process, so
+    the command never waits on the network."""
+    if not update_due():
+        return
+    try:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__),
+                          "update", "--quiet", "--auto"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------- cli
 
 def main(argv=None):
@@ -1022,11 +1174,19 @@ def main(argv=None):
     d.add_argument("name")
     d.add_argument("--force", action="store_true")
 
+    u = sub.add_parser("update", help="update awa now from its git upstream")
+    u.add_argument("--quiet", action="store_true")
+    u.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
+
     a, extra = p.parse_known_args(argv)
     if extra and a.cmd != "log":
         p.error(f"unrecognized arguments: {' '.join(extra)}")
+    if a.cmd not in ("record", "update"):
+        background_update()
     try:
-        if a.cmd == "record":
+        if a.cmd == "update":
+            self_update(quiet=a.quiet, auto=a.auto)
+        elif a.cmd == "record":
             path = a.path or a.repo
             if a.start:
                 record_start(path, tree=a.tree)
