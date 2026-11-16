@@ -4,6 +4,7 @@
 Workspaces for running several coding agents on one git repo:
   record  Watch a folder with inotify and commit every change to a hidden ref
           (refs/awa/record) without touching the branch, index or HEAD.
+          With --tree, one process records every repo under a folder.
   new     Make an isolated copy of a repo (btrfs reflink, instant) on its own
           branch awa/<name>, at <repo>@<name>.
   merge   Merge a copy's branch and run a test in a temporary copy, then
@@ -15,6 +16,7 @@ import argparse
 import ctypes
 import ctypes.util
 import errno
+import fcntl
 import hashlib
 import os
 import select
@@ -22,6 +24,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -29,6 +32,11 @@ RECORD_REF = "refs/awa/record"
 QUIET_SECONDS = 2.0     # commit after writes have been quiet this long
 MAX_DELAY = 30.0        # but never wait longer than this during a burst
 SAFETY_SECONDS = 300.0  # snapshot at least this often, in case events were lost
+REDISCOVER_SECONDS = 60.0  # --tree: look for new or removed repos this often
+UPDATE_SECONDS = 86400.0  # auto-update: check for a new awa this often
+TREE_DEPTH = 4          # --tree: how deep below the folder to look for repos
+AWAIGNORE = ".awaignore"   # per-repo rules, gitignore syntax
+NORECORD = "awa-norecord"  # <git dir>/awa-norecord: --tree skips the repo
 # Ignored dependency and build-cache folders that `awa rm` may delete without
 # checking their contents: tools regenerate them.
 REGENERABLE_DIRS = ("node_modules", ".venv", "venv", "__pycache__", "target",
@@ -64,6 +72,111 @@ def git_dir(repo):
     return Path(git("rev-parse", "--absolute-git-dir", cwd=repo).stdout.strip())
 
 
+# ---------------------------------------------------------------- ignore rules
+
+def config_home():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+
+
+def global_awaignore():
+    return config_home() / "awa" / "ignore"
+
+
+def excludes_file(repo, gd=None):
+    """Write <git dir>/awa/excludes and return its path.
+
+    It holds the user's global git excludes followed by awa's own rules
+    (~/.config/awa/ignore, then the repo's .awaignore). Passed to git as
+    core.excludesFile, so awa's rules use gitignore syntax and rank below the
+    repo's .gitignore files, which can still re-include with `!`.
+    """
+    gd = gd or git_dir(repo)
+    glob = git("config", "--path", "--get", "core.excludesFile", cwd=repo,
+               check=False).stdout.strip()
+    sources = [glob or config_home() / "git" / "ignore", global_awaignore(),
+               Path(repo) / AWAIGNORE]
+    parts = []
+    for f in sources:
+        try:
+            parts.append(Path(f).read_text(errors="replace"))
+        except OSError:
+            parts.append("")
+    (gd / "awa").mkdir(exist_ok=True)
+    out = gd / "awa" / "excludes"
+    _write_if_changed(out, "\n".join(parts) + "\n")
+    # awa's rules alone, beside it: see awa_matches
+    _write_if_changed(out.with_name("awa-rules"), "\n".join(parts[1:]) + "\n")
+    return out
+
+
+def _write_if_changed(path, text):
+    try:
+        if path.read_text(errors="replace") == text:
+            return
+    except OSError:
+        pass
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def awa_matches(rels, excl):
+    """Paths among rels (relative folders) that awa's own rules match,
+    whatever the repo's .gitignore files say: checked in an empty scratch
+    repo holding just those folders."""
+    rules = Path(excl).with_name("awa-rules")
+    try:
+        if not rules.read_text(errors="replace").strip() or not rels:
+            return set()
+    except OSError:
+        return set()
+    with tempfile.TemporaryDirectory(prefix="awa-rules-") as t:
+        git("init", "-q", cwd=t)
+        for r in rels:
+            os.makedirs(os.path.join(t, r), exist_ok=True)
+        return check_ignore(t, list(rels), rules)
+
+
+def check_ignore(repo, rels, excl=None):
+    """Paths among rels (relative, existing) that ignore rules match.
+
+    --no-index: a folder holding tracked files can still match. With excl,
+    awa's rules count too.
+    """
+    if not rels:
+        return set()
+    pre = ("-c", f"core.excludesFile={excl}") if excl else ()
+    r = git(*pre, "check-ignore", "--no-index", "--stdin", "-z", cwd=repo,
+            check=False, input="\0".join(rels) + "\0")
+    return {x for x in r.stdout.split("\0") if x}
+
+
+def skipped_dirs(repo, dirs, excl):
+    """Which of dirs (absolute paths in repo) the recorder doesn't watch.
+
+    A folder is skipped when awa's rules match it (even if it holds tracked
+    files: their changes are caught by the periodic snapshot), or when git
+    ignores it and it holds no tracked files.
+    """
+    repo = str(repo)
+    rel = {os.path.relpath(d, repo): d for d in dirs}
+    skip = awa_matches(list(rel), excl)
+    by_git = check_ignore(repo, [x for x in rel if x not in skip])
+    if by_git:
+        tracked = git("ls-files", "-c", "-z", "--", *sorted(by_git),
+                      cwd=repo, check=False,
+                      env={"GIT_LITERAL_PATHSPECS": "1"}).stdout.split("\0")
+        holding = set()
+        for f in tracked:
+            parent = os.path.dirname(f)
+            while parent:
+                if parent in by_git:
+                    holding.add(parent)
+                parent = os.path.dirname(parent)
+        skip |= by_git - holding
+    return {rel[x] for x in skip if x in rel}
+
+
 # ---------------------------------------------------------------- recording
 
 def snapshot(repo, reason="change"):
@@ -72,10 +185,12 @@ def snapshot(repo, reason="change"):
     The private index starts each time as a copy of the real index, so the
     snapshot holds exactly what `git add -A` would stage now: tracked files
     (even ones matching an ignore rule) plus untracked files that aren't
-    ignored. The agent's own index and HEAD are never touched. Returns the
-    new commit id, or None when nothing changed.
+    ignored, where awa's own rules (.awaignore, ~/.config/awa/ignore) count
+    as ignore rules. The agent's own index and HEAD are never touched.
+    Returns the new commit id, or None when nothing changed.
     """
     gd = git_dir(repo)
+    excl = excludes_file(repo, gd)
     (gd / "awa").mkdir(exist_ok=True)
     priv = gd / "awa" / "index"
     real = gd / "index"
@@ -86,7 +201,8 @@ def snapshot(repo, reason="change"):
     elif priv.exists():
         priv.unlink()
     env = {"GIT_INDEX_FILE": str(priv)}
-    git("add", "-A", "--", ".", cwd=repo, env=env)
+    git("-c", f"core.excludesFile={excl}", "add", "-A", "--", ".", cwd=repo,
+        env=env)
     tree = git("write-tree", cwd=repo, env=env).stdout.strip()
     prev = git("rev-parse", "-q", "--verify", RECORD_REF + "^{commit}",
                cwd=repo, check=False).stdout.strip()
@@ -147,29 +263,34 @@ class Watcher:
         if self.fd < 0:
             raise OSError(ctypes.get_errno(), "inotify_init1 failed")
         self.wd_path = {}
-        self.add_tree(str(self.repo))
+        try:
+            self.excl = excludes_file(self.repo)
+            self.add_tree(str(self.repo))
+        except BaseException:
+            os.close(self.fd)
+            raise
 
-    def ignored_dirs(self):
-        """Directories git ignores (not just ones holding only ignored files)."""
-        r = git("ls-files", "--others", "--ignored", "--exclude-standard",
-                "--directory", "-z", cwd=self.repo, check=False)
-        cand = [x.rstrip("/") for x in r.stdout.split("\0") if x.endswith("/")]
-        if not cand:
-            return set()
-        r = git("check-ignore", "--stdin", "-z", cwd=self.repo, check=False,
-                input="\0".join(cand) + "\0")
-        return {str(self.repo / x) for x in r.stdout.split("\0") if x}
+    def close(self):
+        os.close(self.fd)
 
     def add_tree(self, top):
-        skip = self.ignored_dirs()
-        for root, subdirs, _ in os.walk(top):
-            if root in skip:
-                subdirs[:] = []
-                continue
-            subdirs[:] = [d for d in subdirs if d != ".git"
-                          and os.path.join(root, d) not in skip
-                          and not os.path.islink(os.path.join(root, d))]
-            self.add(root)
+        """Watch top and the folders below it, level by level, so each level
+        costs a few git calls and skipped folders are never entered."""
+        if top != str(self.repo) and skipped_dirs(self.repo, [top], self.excl):
+            return
+        level = [top]
+        while level:
+            below = []
+            for d in level:
+                self.add(d)
+                try:
+                    with os.scandir(d) as it:
+                        below += [e.path for e in it if e.name != ".git"
+                                  and e.is_dir(follow_symlinks=False)]
+                except OSError:
+                    pass  # vanished or unreadable; fine
+            skip = skipped_dirs(self.repo, below, self.excl) if below else ()
+            level = [d for d in below if d not in skip]
 
     def add(self, path):
         wd = self.libc.inotify_add_watch(self.fd, os.fsencode(path), WATCH_MASK)
@@ -213,7 +334,7 @@ class Watcher:
                 continue
             changed = True
             path = os.path.join(parent, fname)
-            if fname == ".gitignore":
+            if fname in (".gitignore", AWAIGNORE):
                 rescan = True  # newly ignored or unignored dirs
             if mask & IN_ISDIR:
                 if mask & (IN_MOVED_FROM | IN_DELETE):
@@ -228,7 +349,61 @@ class Watcher:
         for wd in list(self.wd_path):
             self.libc.inotify_rm_watch(self.fd, wd)
         self.wd_path.clear()
+        self.excl = excludes_file(self.repo)
         self.add_tree(str(self.repo))
+
+
+class Recorder:
+    """One repo's watcher and snapshot timing."""
+
+    def __init__(self, repo, offset=0.0, label=""):
+        self.repo = Path(repo)
+        self.label = label  # message prefix; names the repo under --tree
+        self.watcher = Watcher(self.repo)
+        self.pending_since = None
+        self.last_event = 0.0
+        self.last_snap = time.monotonic() - offset
+
+    def gone(self):
+        return not (self.repo / ".git").exists()
+
+    def deadline(self):
+        if self.pending_since is not None:
+            return min(self.last_event + QUIET_SECONDS,
+                       self.pending_since + MAX_DELAY)
+        return self.last_snap + SAFETY_SECONDS
+
+    def on_ready(self, now):
+        try:
+            got = self.watcher.read()
+        except OSError:
+            if self.gone():
+                return  # the caller's next check drops it cleanly
+            raise
+        if got:
+            self.last_event = now
+            if self.pending_since is None:
+                self.pending_since = now
+
+    def maybe_snapshot(self, now):
+        pending = self.pending_since is not None
+        due = pending and (now - self.last_event >= QUIET_SECONDS
+                           or now - self.pending_since >= MAX_DELAY)
+        if not (due or now - self.last_snap >= SAFETY_SECONDS):
+            return
+        try:
+            c = snapshot(self.repo, "change" if due else "periodic")
+            if c:
+                print(f"awa: {self.label}snapshot {c[:10]}", flush=True)
+        except (RuntimeError, OSError) as e:  # e.g. a lock; retry later
+            print(f"awa: {self.label}snapshot failed, will retry: {e}",
+                  flush=True)
+            self.last_event = now  # retry after QUIET_SECONDS, not at once
+            if self.pending_since is None:
+                self.pending_since = now
+            return
+        self.pending_since = None
+        self.last_snap = now
 
 
 def record_loop(repo, once=False):
@@ -238,48 +413,137 @@ def record_loop(repo, once=False):
           + (f" (snapshot {first[:10]})" if first else ""), flush=True)
     if once:
         return
-    w = Watcher(repo)
-    pending_since = None
-    last_event = 0.0
-    last_snap = time.monotonic()
+    r = Recorder(repo)
+    rules = rules_stamp()
     while True:
-        if not (repo / ".git").exists():
+        maybe_reexec()
+        if r.gone():
             print(f"awa: {repo} is gone; stopping", flush=True)
             return
+        if rules_stamp() != rules:  # ~/.config/awa/ignore changed
+            rules = rules_stamp()
+            r.watcher.rescan()
+        timeout = max(0.0, r.deadline() - time.monotonic())
+        ready, _, _ = select.select([r.watcher.fd], [], [], min(timeout, 10.0))
         now = time.monotonic()
-        if pending_since is not None:
-            timeout = max(0.0, min(last_event + QUIET_SECONDS,
-                                   pending_since + MAX_DELAY) - now)
+        if ready:
+            r.on_ready(now)
+        r.maybe_snapshot(now)
+
+
+def rules_stamp():
+    """Changes when ~/.config/awa/ignore does."""
+    try:
+        st = os.stat(global_awaignore())
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return None
+
+
+def discover(root, depth=TREE_DEPTH):
+    """Git repos (main checkouts, not worktrees) at most depth levels below
+    root, skipping dependency folders and repos with <git dir>/awa-norecord."""
+    root = os.path.realpath(root)
+    base = root.rstrip(os.sep).count(os.sep)
+    found = []
+    for d, subdirs, _ in os.walk(root):
+        if ".git" in subdirs and not os.path.exists(
+                os.path.join(d, ".git", NORECORD)):
+            found.append(d)
+        if d.count(os.sep) - base >= depth:
+            subdirs[:] = []
         else:
-            timeout = max(0.0, last_snap + SAFETY_SECONDS - now)
-        ready, _, _ = select.select([w.fd], [], [], min(timeout, 10.0))
+            subdirs[:] = [s for s in subdirs if s != ".git"
+                          and s not in REGENERABLE_DIRS]
+    return found
+
+
+def recording_units():
+    """Names of the active per-repo recorder units (awa record --start)."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "list-units", "--plain",
+                            "--no-legend", "--state=active", "awa-record-*"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    return {line.split()[0].removesuffix(".service")
+            for line in r.stdout.splitlines() if line.strip()}
+
+
+def record_tree(root, once=False, stop=None):
+    """Record every repo under root from one process.
+
+    Finds repos again every REDISCOVER_SECONDS, so new ones are picked up and
+    removed ones dropped. A repo that already has its own recorder unit
+    (awa record --start, awa new --record) is left to it.
+    """
+    root = os.path.realpath(root)
+    if not os.path.isdir(root):
+        die(f"{root} is not a folder")
+    recs = {}
+    rules = rules_stamp()
+    next_scan = 0.0
+    while stop is None or not stop.is_set():
         now = time.monotonic()
-        try:
-            got = bool(ready) and w.read()
-        except OSError:
-            if not (repo / ".git").exists():
-                continue  # the loop's next check stops cleanly
-            raise
-        if got:
-            last_event = now
-            if pending_since is None:
-                pending_since = now
-            if now - pending_since < MAX_DELAY:
-                continue
-        due = (pending_since is not None
-               and (now - last_event >= QUIET_SECONDS
-                    or now - pending_since >= MAX_DELAY))
-        if due or now - last_snap >= SAFETY_SECONDS:
+        if now >= next_scan:
+            if not once:
+                maybe_reexec()
+            next_scan = now + REDISCOVER_SECONDS
+            busy = recording_units()
+            want = [d for d in discover(root) if unit_name(Path(d)) not in busy]
+            before = len(recs)
+            for d in [d for d in recs if d not in want]:
+                recs.pop(d).watcher.close()
+                print(f"awa: {d}: no longer recorded here", flush=True)
+            for d in want:
+                if d in recs:
+                    continue
+                try:
+                    first = snapshot(d, "start")
+                    if once:
+                        if first:
+                            print(f"awa: {d}: snapshot {first[:10]}",
+                                  flush=True)
+                        continue
+                    h = int(hashlib.sha1(d.encode()).hexdigest()[:8], 16)
+                    recs[d] = Recorder(d, label=f"{d}: ",
+                                       offset=SAFETY_SECONDS * (h % 1000) / 1000)
+                except (RuntimeError, OSError) as e:
+                    print(f"awa: {d}: not recording: {e}", flush=True)
+            if once:
+                return
+            if len(recs) != before:
+                print(f"awa: recording {len(recs)} repos under {root}",
+                      flush=True)
+            if rules_stamp() != rules:  # ~/.config/awa/ignore changed
+                rules = rules_stamp()
+                for d, r in list(recs.items()):
+                    try:
+                        r.watcher.rescan()
+                    except (RuntimeError, OSError) as e:
+                        print(f"awa: {d}: rescan failed: {e}", flush=True)
+        fds = {r.watcher.fd: r for r in recs.values()}
+        deadline = min([r.deadline() for r in recs.values()] + [next_scan])
+        timeout = min(max(0.0, deadline - time.monotonic()), 10.0)
+        ready, _, _ = select.select(list(fds), [], [], timeout)
+        now = time.monotonic()
+        for fd in ready:
+            r = fds[fd]
             try:
-                c = snapshot(repo, "change" if due else "periodic")
-                if c:
-                    print(f"awa: snapshot {c[:10]}", flush=True)
-            except (RuntimeError, OSError) as e:  # e.g. a lock; retry later
-                print(f"awa: snapshot failed, will retry: {e}", flush=True)
-                last_event = now
+                r.on_ready(now)
+            except (RuntimeError, OSError) as e:
+                print(f"awa: {r.label}watch failed, retrying later: {e}",
+                      flush=True)
+                recs.pop(str(r.repo), None)
+                r.watcher.close()
+        for d, r in list(recs.items()):
+            if r.gone():
+                recs.pop(d).watcher.close()
+                print(f"awa: {d} is gone", flush=True)
                 continue
-            pending_since = None
-            last_snap = now
+            r.maybe_snapshot(now)
+    for r in recs.values():
+        r.watcher.close()
 
 
 def unit_name(repo):
@@ -287,27 +551,42 @@ def unit_name(repo):
     return f"awa-record-{Path(repo).name[:40]}-{h}"
 
 
-def record_start(repo):
-    repo = toplevel(repo)
-    unit = unit_name(repo)
+def tree_unit_name(root):
+    h = hashlib.sha1(str(root).encode()).hexdigest()[:10]
+    return f"awa-tree-{Path(root).name[:40]}-{h}"
+
+
+def record_start(path, tree=False):
+    if tree:
+        target = Path(os.path.realpath(path))
+        unit, args = tree_unit_name(target), ["record", "--tree", str(target)]
+    else:
+        target = toplevel(path)
+        unit, args = unit_name(target), ["record", str(target)]
     r = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit])
     if r.returncode == 0:
-        print(f"awa: already recording {repo} ({unit})")
+        print(f"awa: already recording {target} ({unit})")
         return
     subprocess.run(["systemctl", "--user", "reset-failed", unit],
                    capture_output=True)
     subprocess.run(["systemd-run", "--user", "--quiet", f"--unit={unit}",
                     "--property=Restart=on-failure",
                     "--property=RestartSec=5",
-                    f"--working-directory={repo}",
-                    sys.executable, os.path.abspath(__file__), "record",
-                    str(repo)], check=True)
-    print(f"awa: recording {repo} in the background ({unit}); "
+                    f"--working-directory={target}",
+                    sys.executable, os.path.abspath(__file__), *args],
+                   check=True)
+    print(f"awa: recording {target} in the background ({unit}); "
           f"logs: journalctl --user -u {unit}")
 
 
-def record_stop(repo):
-    repo = toplevel(repo)
+def record_stop(path, tree=False):
+    if tree:
+        unit = tree_unit_name(Path(os.path.realpath(path)))
+        subprocess.run(["systemctl", "--user", "stop", unit],
+                       capture_output=True)
+        print(f"awa: stopped {unit}")
+        return
+    repo = toplevel(path)
     unit = unit_name(repo)
     subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True)
     try:
@@ -607,6 +886,153 @@ def ws_list(repo):
         print("awa: no workspaces")
 
 
+# ---------------------------------------------------------------- updates
+
+def awa_checkout():
+    """The git checkout awa.py runs from (through any symlink)."""
+    return Path(os.path.realpath(__file__)).parent
+
+
+def auto_update_enabled():
+    """On unless AWA_NO_AUTO_UPDATE is set or ~/.config/awa/no-auto-update
+    exists."""
+    return not (os.environ.get("AWA_NO_AUTO_UPDATE")
+                or (config_home() / "awa" / "no-auto-update").exists())
+
+
+def update_stamp():
+    cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return cache / "awa" / "last-update-check"
+
+
+def update_due():
+    """Whether auto-update should check now; at most once per UPDATE_SECONDS
+    across all awa processes."""
+    if not auto_update_enabled():
+        return False
+    try:
+        return time.time() - update_stamp().stat().st_mtime >= UPDATE_SECONDS
+    except OSError:
+        return True
+
+
+def self_update(src=None, quiet=False, auto=False):
+    """Fast-forward awa's checkout to its upstream branch.
+
+    Leaves it alone when tracked files have local changes, when it isn't on
+    a branch with an upstream, or when it has commits the upstream lacks.
+    One update runs at a time; with auto, only when one is due.
+    Returns True when the checkout moved to a new commit.
+    """
+    src = Path(src or awa_checkout())
+    say = (lambda m: None) if quiet else (lambda m: print(f"awa: {m}",
+                                                          flush=True))
+    p = update_stamp()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(p.with_name("update.lock"), "w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        say("not updating: another update is running")
+        return False
+    with lock:
+        if auto and not update_due():
+            return False
+        try:
+            p.touch()
+        except OSError:
+            pass
+        return _ff_checkout(src, say)
+
+
+def _ff_checkout(src, say):
+    env = {"GIT_TERMINAL_PROMPT": "0"}
+    if "GIT_SSH_COMMAND" not in os.environ:
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+
+    def run(*args, timeout=30):
+        return subprocess.run(["git", *args], cwd=src, capture_output=True,
+                              text=True, timeout=timeout,
+                              env={**os.environ, **env})
+    try:
+        if run("rev-parse", "--is-inside-work-tree").returncode != 0:
+            say(f"not updating: {src} is not a git checkout")
+            return False
+        if run("rev-parse", "--abbrev-ref", "@{u}").returncode != 0:
+            say(f"not updating: {src} has no upstream branch")
+            return False
+        if run("status", "--porcelain", "--untracked-files=no").stdout.strip():
+            say(f"not updating: {src} has local changes")
+            return False
+        old = run("rev-parse", "HEAD").stdout.strip()
+        f = run("fetch", "--quiet", timeout=120)
+        if f.returncode != 0:
+            say(f"update check failed: {f.stderr.strip()}")
+            return False
+        m = run("merge", "--ff-only", "--quiet", "@{u}")
+        if m.returncode != 0:
+            say(f"not updating: {src} has commits its upstream lacks")
+            return False
+        new = run("rev-parse", "HEAD").stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        say(f"update check failed: {e}")
+        return False
+    if new == old:
+        say("awa is up to date")
+        return False
+    print(f"awa: updated {old[:10]} -> {new[:10]}", flush=True)
+    return True
+
+
+def checkout_head():
+    r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=awa_checkout(),
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+_running = {"head": None, "next": 0.0}  # this recorder's code and next check
+
+
+def maybe_reexec():
+    """In a long-running recorder, once a day: auto-update if due, and
+    restart on the new code if the checkout moved to another commit (by
+    this or any other awa process) and it compiles. A restart loses
+    nothing: the recorder snapshots every repo when it starts."""
+    now = time.monotonic()
+    if _running["head"] is None:
+        _running["head"] = checkout_head()
+    if now < _running["next"] or not auto_update_enabled():
+        return
+    _running["next"] = now + UPDATE_SECONDS
+    self_update(quiet=True, auto=True)
+    head = checkout_head()
+    if head is None or head == _running["head"]:
+        return
+    me = os.path.realpath(__file__)
+    r = subprocess.run([sys.executable, "-m", "py_compile", me],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"awa: new version does not compile; still running the old "
+              f"one: {r.stderr.strip()}", flush=True)
+        return
+    print("awa: restarting on the new version", flush=True)
+    os.execv(sys.executable, [sys.executable, me, *sys.argv[1:]])
+
+
+def background_update():
+    """From a short command: check for an update in a detached process, so
+    the command never waits on the network."""
+    if not update_due():
+        return
+    try:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__),
+                          "update", "--quiet", "--auto"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------- cli
 
 def main(argv=None):
@@ -623,6 +1049,8 @@ def main(argv=None):
     g.add_argument("--start", action="store_true", help="run in the background")
     g.add_argument("--stop", action="store_true", help="stop background recorder")
     g.add_argument("--once", action="store_true", help="take one snapshot")
+    r.add_argument("--tree", action="store_true",
+                   help="record every git repo under path, from one process")
 
     n = sub.add_parser("new", help="make an isolated copy <repo>@<name>")
     n.add_argument("name")
@@ -643,14 +1071,24 @@ def main(argv=None):
     d.add_argument("name")
     d.add_argument("--force", action="store_true")
 
+    u = sub.add_parser("update", help="update awa now from its git upstream")
+    u.add_argument("--quiet", action="store_true")
+    u.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
+
     a = p.parse_args(argv)
+    if a.cmd not in ("record", "update"):
+        background_update()
     try:
-        if a.cmd == "record":
+        if a.cmd == "update":
+            self_update(quiet=a.quiet, auto=a.auto)
+        elif a.cmd == "record":
             path = a.path or a.repo
             if a.start:
-                record_start(path)
+                record_start(path, tree=a.tree)
             elif a.stop:
-                record_stop(path)
+                record_stop(path, tree=a.tree)
+            elif a.tree:
+                record_tree(path, once=a.once)
             else:
                 record_loop(path, once=a.once)
         elif a.cmd == "new":

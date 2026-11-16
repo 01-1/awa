@@ -31,6 +31,7 @@ It does three things:
 awa record --start           # record this folder in the background (systemd user unit)
 awa record --stop
 git log refs/awa/record      # the edit history
+awa record --tree ~/code --start   # record every repo under ~/code from one process
 
 awa new fix-auth --record    # isolated copy ../proj@fix-auth, recorded
 awa merge fix-auth --test 'pytest -x tests/test_auth.py'
@@ -51,6 +52,26 @@ tools regenerate.
 It keeps the copy's edit history in the repo as
 `refs/awa/record-NAME-<timestamp>`.
 
+## Recording many repos
+
+`awa record --tree DIR` records every git repo up to 4 levels below `DIR`
+from one process (about 20 MB, instead of one process per repo). It looks
+for new and removed repos every minute. It skips git worktrees, folders
+named like dependency or build caches (`node_modules`, `.venv` and the
+like), repos that have their own recorder (`awa record --start`,
+`awa new --record`), and repos with a file `.git/awa-norecord`.
+
+## Ignoring folders: .awaignore
+
+`.awaignore` in a repo, and `~/.config/awa/ignore` for every repo, hold
+rules in `.gitignore` syntax that only awa uses. Matching folders aren't
+watched, even when they hold tracked files: changes to those files are
+still recorded, by the next snapshot of the repo (at most 5 minutes later).
+Untracked files they match are left out of snapshots. Use them for large
+regenerable or vendored folders that git tracks or doesn't ignore. The
+repo's `.gitignore` files rank above these rules, so `!pattern` there
+re-includes a path. git itself never reads them.
+
 ## When to isolate
 
 Isolate when agents edit the same files or area, or when one agent's
@@ -65,6 +86,13 @@ servers.
 ln -s "$PWD/awa.py" ~/.local/bin/awa
 ```
 
+awa updates itself: once a day, a running recorder or any other awa
+command fast-forwards awa's own git checkout to its upstream branch
+(a recorder then restarts on the new code). It skips the update when the
+checkout has local changes or commits the upstream lacks. Turn this off
+with `touch ~/.config/awa/no-auto-update` (or `AWA_NO_AUTO_UPDATE=1`);
+`awa update` updates now either way.
+
 Python 3.9+, git 2.38+, Linux, systemd (only for `record --start`). No packages.
 Tests: `python3 test_awa.py` (uses `~/.cache/awa-test`, or `AWA_TEST_DIR`).
 
@@ -75,7 +103,9 @@ Tests: `python3 test_awa.py` (uses `~/.cache/awa-test`, or `AWA_TEST_DIR`).
 - A git worktree as the source repo is refused. Run awa from the main
   checkout.
 - The recorder uses one inotify watch per directory. Ignored directories
-  aren't watched. Changes to `.git/info/exclude` aren't noticed until the next
+  (by `.gitignore` or `.awaignore`) aren't watched. fanotify can't replace
+  this on a btrfs subvolume: there it reports writes but not creates,
+  deletes or renames. Changes to `.git/info/exclude` aren't noticed until the next
   `.gitignore` change or restart.
 - `--test` runs in a temporary copy, so tests that write to absolute paths
   in the repo affect the real repo.
