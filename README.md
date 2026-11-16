@@ -86,6 +86,13 @@ servers.
 ln -s "$PWD/awa.py" ~/.local/bin/awa
 ```
 
+awa updates itself: once a day, a running recorder or any other awa
+command fast-forwards awa's own git checkout to its upstream branch
+(a recorder then restarts on the new code). It skips the update when the
+checkout has local changes or commits the upstream lacks. Turn this off
+with `touch ~/.config/awa/no-auto-update` (or `AWA_NO_AUTO_UPDATE=1`);
+`awa update` updates now either way.
+
 Python 3.9+, git 2.38+, Linux, systemd (only for `record --start`). No packages.
 Tests: `python3 test_awa.py` (uses `~/.cache/awa-test`, or `AWA_TEST_DIR`).
 
