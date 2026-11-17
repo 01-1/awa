@@ -22,9 +22,11 @@ It does three things:
   and runs the test in a temporary copy of the repo. The repo is only changed
   by a final fast-forward, which git refuses if it would overwrite local or
   ignored files, or if the repo moved meanwhile. A conflict or failed test
-  leaves the repo as it was. Either way, the repo's branch is then merged
-  back into the copy the same safe way (computed with `git merge-tree`,
-  applied by fast-forward), so the agent sees everyone else's work.
+  leaves the repo as it was. Either way, awa then tries to merge the repo's
+  branch back into the copy the same safe way (computed with `git merge-tree`,
+  applied by fast-forward). Sync is skipped if the copy has uncommitted
+  tracked changes, and conflicts leave it unchanged. Commit the edits and
+  run `awa sync NAME` to retry; resolve conflicts in the copy.
 
 ## Use
 
@@ -114,8 +116,8 @@ Tests: `python3 test_awa.py` (uses `~/.cache/awa-test`, or `AWA_TEST_DIR`).
 
 - The store grows without limit. It stores only changed files, but
   nothing prunes it.
-- A git worktree as the source repo is refused. Run awa from the main
-  checkout.
+- `awa new` refuses a git worktree as the source repo. Create isolated
+  copies from the main checkout.
 - The recorder uses one inotify watch per directory. Ignored directories
   (by `.gitignore` or `.awaignore`) aren't watched. fanotify can't replace
   this on a btrfs subvolume: there it reports writes but not creates,
