@@ -264,16 +264,7 @@ def store_index():
     hit = _index.get(str(root))
     if hit and time.monotonic() - hit[0] < INDEX_SECONDS:
         return hit[1]
-    found = {}
-    for d, subdirs, _ in os.walk(root):
-        keep = []
-        for s in subdirs:
-            p = os.path.join(d, s)
-            if s.endswith(".git") and os.path.exists(os.path.join(p, "HEAD")):
-                found[p] = _store_info(Path(p))
-            elif ".git.tmp" not in s:
-                keep.append(s)
-        subdirs[:] = keep
+    found = {str(p): _store_info(p) for p in store_dirs(root)}
     _index[str(root)] = (time.monotonic(), found)
     return found
 
