@@ -426,6 +426,29 @@ class Moves(Base):
         self.assertEqual(sh(f"{store(moved)} rev-parse {c3}^", self.tmp), c1)
         self.assertEqual(self.ref(copy), c2)
 
+    def moved_and_replaced(self, replacement_first):
+        c1 = awa.snapshot(self.repo)
+        new = self.move(self.repo, "moved/proj")
+        self.repo.mkdir()  # a new repo takes the old path
+        sh("git init -q -b main && echo r > r.txt && git add -A && "
+           "git commit -qm r", self.repo)
+        self.restart()
+        (new / "c.txt").write_text("c\n")
+        for d in ([self.repo, new] if replacement_first else
+                  [new, self.repo]):
+            awa.snapshot(d)
+        sh(f"{store(new)} merge-base --is-ancestor {c1} {awa.RECORD_REF}",
+           self.tmp)
+        self.assertEqual(sh(f"{store(self.repo)} rev-list --count "
+                            f"{awa.RECORD_REF}", self.tmp), "1")
+        self.assertEqual(len(self.stores()), 2)
+
+    def test_moved_and_replaced_new_path_seen_first(self):
+        self.moved_and_replaced(False)
+
+    def test_moved_and_replaced_old_path_seen_first(self):
+        self.moved_and_replaced(True)
+
     def test_merges_into_a_store_already_at_the_new_path(self):
         c1 = awa.snapshot(self.repo)
         old = awa.store_dir(self.repo)

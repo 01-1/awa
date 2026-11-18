@@ -75,7 +75,9 @@ nested inside the moved one follow it. This works whether the move happened
 while awa was running or not. Stores made before awa kept ids match when the
 repo's HEAD reflog holds the commit their last snapshot was taken at. A copy
 of a recorded repo, with the original still present, gets an id and a store
-of its own.
+of its own. If a new repo takes a moved repo's old path first, the old store
+is renamed aside (`<name>@awa-moved-<id>-<time>.git`) until the moved repo
+claims it.
 
 ## Recording many repos
 
