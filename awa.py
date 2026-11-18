@@ -372,8 +372,8 @@ def claim_store(repo, st, create=True):
     before awa kept ids matches when repo's HEAD reflog, and no other
     recorded repo's, holds the commit its last snapshot was taken at. A copy
     of a recorded repo (both still present) gets an id of its own. Returns
-    False if a store it should take over was left behind, so that a later
-    call tries again.
+    the repo's id, or None if a store it should take over was left behind,
+    so that a later call tries again.
     """
     repo = Path(os.path.realpath(repo))
     gd = git_dir(repo)
@@ -427,7 +427,7 @@ def claim_store(repo, st, create=True):
                    key=lambda s: _tip_time(s), reverse=True)
     for s in found:
         if s not in idx or not os.path.exists(s):
-            continue  # taken by a nested repo's claim below
+            continue  # taken by a nested repo's claim
         old = idx[s].get("path")
         nested = True  # repos nested in the moved one follow it first
         for s2, i2 in list(idx.items()):
@@ -435,8 +435,8 @@ def claim_store(repo, st, create=True):
             if s2 in idx and p2.startswith(old + os.sep) and not _live(i2):
                 inner = repo / os.path.relpath(p2, old)
                 if (inner / ".git").exists():
-                    nested &= claim_store(inner, store_dir(inner),
-                                          create=False)
+                    nested &= bool(claim_store(inner, store_dir(inner),
+                                               create=False))
         if not nested:  # keep the old parent store, so a retry finds them
             ok = False
             continue
@@ -458,7 +458,7 @@ def claim_store(repo, st, create=True):
         _prune_empty(Path(s).parent)
     if not (st / "HEAD").exists():
         if not create:
-            return ok
+            return rid if ok else None
         st.parent.mkdir(parents=True, exist_ok=True)
         tmp = st.with_name(f"{st.name}.tmp{os.getpid()}")
         shutil.rmtree(tmp, ignore_errors=True)
@@ -470,7 +470,7 @@ def claim_store(repo, st, create=True):
         git("config", "awa.id", rid, cwd=st)
         info.update(path=str(repo), id=rid)
         info.pop("head", None)
-    return ok
+    return rid if ok else None
 
 
 def open_store(repo):
@@ -484,8 +484,9 @@ def open_store(repo):
         stores_root().mkdir(parents=True, exist_ok=True)
         with open(stores_root() / ".lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)  # one claim at a time
-            if claim_store(repo, st):
-                _checked[key] = path_id(repo)
+            rid = claim_store(repo, st)
+            if rid:
+                _checked[key] = rid
     for sha, ref in _recorded_refs(["-C", str(repo)]):
         _install_ref(st, repo, ref, sha, "imported")
         git("update-ref", "-d", ref, sha, cwd=repo)
