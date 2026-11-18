@@ -6,8 +6,10 @@ Workspaces for running several coding agents on one git repo:
           refs/awa/record of a bare repo in ~/.local/share/awa/, without
           touching the folder's branch, index, HEAD, refs or objects.
           With --tree, one process records every repo under a folder.
-  new     Make an isolated copy of a repo (btrfs reflink, instant) on its own
-          branch awa/<name>, at <repo>@<name>.
+  new     Make an isolated copy of a repo (a btrfs snapshot if the repo is a
+          subvolume, else a reflink copy) on its own branch awa/<name>, at
+          <repo>@<name>.
+  subvol  Turn a repo folder into a btrfs subvolume in place.
   merge   Merge a copy's branch and run a test in a temporary copy, then
           fast-forward the repo; bring the copy up to date.
   log     Show a repo's recorded history (git log arguments pass through).
@@ -978,6 +980,56 @@ def reflink_copy(src, dest):
         subprocess.run(["cp", "-a", str(src), str(dest)], check=True)
 
 
+def fs_type(path):
+    r = subprocess.run(["stat", "-f", "-c", "%T", str(path)],
+                       capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def is_subvol(path):
+    """True if path is the root of a btrfs subvolume (always inode 256)."""
+    try:
+        if os.lstat(path).st_ino != 256:
+            return False
+    except OSError:
+        return False
+    return fs_type(path) == "btrfs"
+
+
+def make_copy(src, dest):
+    """Copy src to dest: a btrfs snapshot if src is a subvolume, else a
+    reflink copy (a full copy where reflinks aren't supported)."""
+    if is_subvol(src):
+        r = subprocess.run(["btrfs", "subvolume", "snapshot", str(src),
+                            str(dest)], capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        print(f"awa: btrfs snapshot failed ({r.stderr.strip()}); "
+              "falling back to a reflink copy", file=sys.stderr)
+    reflink_copy(src, dest)
+
+
+def remove_tree(path):
+    """Delete a folder or btrfs subvolume. Raises RuntimeError naming what
+    is left if it can't delete it all."""
+    if is_subvol(path):
+        r = subprocess.run(["btrfs", "subvolume", "delete", str(path)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        # Without the user_subvol_rm_allowed mount option only root may
+        # delete a subvolume, but anyone may rmdir an empty one they own.
+        print(f"awa: btrfs subvolume delete of {path} failed (mount with "
+              "user_subvol_rm_allowed to allow it); deleting its files one "
+              "by one", file=sys.stderr)
+    try:
+        shutil.rmtree(path)
+    except OSError as e:
+        left = "it is still there" if os.path.lexists(path) else "nothing"
+        raise RuntimeError(f"deleting {path} failed ({e}); {left} "
+                           "is left") from e
+
+
 def ws_new(repo, name, record):
     repo = toplevel(repo)
     check_name(name)
@@ -990,7 +1042,7 @@ def ws_new(repo, name, record):
     if dirty(repo, untracked=False):
         print("awa: note: the repo has uncommitted changes; the copy gets "
               "them too", file=sys.stderr)
-    reflink_copy(repo, dest)
+    make_copy(repo, dest)
     # The copy must not share the repo's recorder state or refs.
     shutil.rmtree(git_dir(dest) / "awa", ignore_errors=True)
     for ref in git("for-each-ref", "--format=%(refname)", "refs/awa/",
@@ -1087,7 +1139,7 @@ def try_merge(repo, dest, name, test):
               "one crashed. Delete it if no merge is running.")
         return 1
     try:
-        reflink_copy(repo, cand)
+        make_copy(repo, cand)
         git("reset", "-q", "--hard", "HEAD", cwd=cand)
         r = git("merge", "--no-ff", "--no-edit", "-q", "--no-overwrite-ignore",
                 "-m", f"Merge workspace {name}", incoming, cwd=cand,
@@ -1125,7 +1177,10 @@ def try_merge(repo, dest, name, test):
         print(f"awa: merged {branch} into {repo.name} ({merged[:10]})")
         return 0
     finally:
-        shutil.rmtree(cand, ignore_errors=True)
+        try:
+            remove_tree(cand)
+        except RuntimeError as e:
+            print(f"awa: {e}", file=sys.stderr)
 
 
 def ws_merge(repo, name, test):
@@ -1203,10 +1258,179 @@ def ws_rm(repo, name, force):
         git("--git-dir", str(st), "fetch", "-q", str(src),
             *[f"{r}:{kept}{r[len(RECORD_REF):]}" for r in refs], cwd="/")
         print(f"awa: kept its edit history as {kept} in {st}")
-    shutil.rmtree(dest)
+    remove_tree(dest)
     shutil.rmtree(src, ignore_errors=True)
     git("update-ref", "-d", f"refs/awa/incoming/{name}", cwd=repo, check=False)
     print(f"awa: removed {dest}")
+
+
+def tree_listing(root):
+    """Every entry below root with its type, mode, size, mtime and link
+    target, sorted; and the inode numbers of everything in it."""
+    out, inodes = [], {os.lstat(root).st_ino}
+    for d, subdirs, files in os.walk(root):
+        for n in subdirs + files:
+            path = os.path.join(d, n)
+            st = os.lstat(path)
+            inodes.add(st.st_ino)
+            rel = os.path.relpath(path, root)
+            if os.path.isdir(path) and not os.path.islink(path):
+                out.append((rel, "d", st.st_mode, 0, 0, ""))
+            else:
+                link = os.readlink(path) if os.path.islink(path) else ""
+                out.append((rel, "f", st.st_mode, st.st_size,
+                            st.st_mtime_ns, link))
+    return sorted(out), inodes
+
+
+def watch_key(root):
+    """How inotify fdinfo names the filesystem of root: the superblock's
+    device (st_dev differs on btrfs) and, on btrfs, the subvolume id."""
+    r = subprocess.run(["findmnt", "-no", "MAJ:MIN", "-T", str(root)],
+                       capture_output=True, text=True)
+    major, minor = (int(x) for x in r.stdout.split()[0].split(":"))
+    r = subprocess.run(["btrfs", "inspect-internal", "rootid", str(root)],
+                       capture_output=True, text=True)
+    return (major << 20) | minor, int(r.stdout) if r.returncode == 0 else None
+
+
+def watches_inside(line, inodes, key):
+    """Whether an inotify fdinfo line watches one of the inodes."""
+    kv = dict(x.split(":", 1) for x in line.split()[1:] if ":" in x)
+    try:
+        if (int(kv["ino"], 16) not in inodes
+                or int(kv["sdev"], 16) != key[0]):
+            return False
+        # A btrfs file handle starts with the inode's objectid and its
+        # subvolume's id, little-endian; inode numbers repeat across
+        # subvolumes.
+        if key[1] is not None and kv.get("fhandle-type") in ("4d", "4e",
+                                                              "4f"):
+            h = bytes.fromhex(kv["f_handle"])
+            return int.from_bytes(h[8:16], "little") == key[1]
+    except (KeyError, ValueError):
+        return False
+    return True
+
+
+def holders(root, inodes):
+    """Processes using anything inside root: their cwd, root folder, open
+    files, or inotify watches."""
+    root = os.path.realpath(root)
+    key = watch_key(root)
+    inside = (lambda t: t == root or t.startswith(root + "/"))
+    found = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        why = set()
+        try:
+            for link in ("cwd", "root"):
+                if inside(os.readlink(f"/proc/{pid}/{link}")):
+                    why.add(link)
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if inside(target):
+                    why.add("open files")
+                elif target == "anon_inode:inotify":
+                    try:
+                        with open(f"/proc/{pid}/fdinfo/{fd}") as f:
+                            if any(line.startswith("inotify ") and
+                                   watches_inside(line, inodes, key)
+                                   for line in f):
+                                why.add("inotify watches")
+                    except OSError:
+                        continue  # closed meanwhile
+        except OSError:
+            pass  # gone, or another user's
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                comm = f.read().strip()
+        except OSError:
+            comm = "?"
+        if why:
+            found.append(f"{pid} ({comm}): {', '.join(sorted(why))}")
+    return found
+
+
+def ws_subvol(path):
+    """Turn a repo folder into a btrfs subvolume in place, so `awa new`
+    snapshots it."""
+    given = Path(os.path.abspath(path))
+    given_old = given.parent / f".{given.name}@awa-old"
+    if not os.path.lexists(given) and os.path.lexists(given_old):
+        die(f"{given} is missing, and {given_old} holds it from a conversion "
+            f"that stopped: move it back to {given}")
+    repo = toplevel(path)
+    if fs_type(repo) != "btrfs":
+        die(f"{repo} is not on btrfs")
+    os.chdir(repo.parent)  # don't hold the folder ourselves
+    new = repo.parent / f".{repo.name}@awa-subvol"
+    old = repo.parent / f".{repo.name}@awa-old"
+    if is_subvol(repo):
+        if os.path.lexists(old):
+            print(f"awa: {old} is probably the old folder from a conversion "
+                  "whose cleanup was cut short; delete it if you don't need "
+                  "it", file=sys.stderr)
+        print(f"awa: {repo} is already a btrfs subvolume")
+        return
+    if os.path.lexists(old):
+        die(f"{old} exists: it holds the folder from a conversion that "
+            f"stopped after moving it. If {repo} is missing anything, it is "
+            "there; move it back or delete it, then run this again.")
+    if os.path.lexists(new):
+        die(f"{new} exists: another conversion is running, or one stopped "
+            "before swapping (the folder is intact). Delete it if none is "
+            "running.")
+    listing, inodes = tree_listing(repo)
+    busy = holders(repo, inodes)
+    if busy:
+        die(f"not converting {repo}: processes are using it:\n"
+            + "\n".join(busy) + "\nStop them or move them out of it (a "
+            "shell: cd out; a recorder: awa record --stop, or --tree --stop "
+            "on its folder), then run this again.")
+    r = subprocess.run(["btrfs", "subvolume", "create", str(new)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"btrfs subvolume create failed: {r.stderr.strip()}")
+    try:
+        r = subprocess.run(["cp", "-a", "--reflink=always", f"{repo}/.",
+                            f"{new}/"], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"copying failed: {r.stderr.strip()}")
+        if tree_listing(new)[0] != listing or tree_listing(repo)[0] != listing:
+            raise RuntimeError("the copy differs from the folder (did "
+                               "something write to it meanwhile?)")
+        busy = holders(repo, inodes)
+        if busy:
+            raise RuntimeError("processes started using it:\n"
+                               + "\n".join(busy))
+        st = os.lstat(repo)
+        os.chmod(new, st.st_mode & 0o7777)
+        os.utime(new, ns=(st.st_atime_ns, st.st_mtime_ns))
+        os.rename(repo, old)
+        try:
+            os.rename(new, repo)
+        except OSError:
+            os.rename(old, repo)
+            raise
+    except (RuntimeError, OSError) as e:
+        try:
+            remove_tree(new)
+        except RuntimeError as e2:
+            print(f"awa: {e2}", file=sys.stderr)
+        die(f"not converting {repo}: {e}; it is unchanged")
+    try:
+        shutil.rmtree(old)
+    except OSError as e:
+        print(f"awa: {repo} is now a btrfs subvolume, but deleting the old "
+              f"folder {old} failed ({e}); delete it by hand",
+              file=sys.stderr)
+        return
+    print(f"awa: {repo} is now a btrfs subvolume; awa new snapshots it")
 
 
 def ws_list(repo):
@@ -1708,6 +1932,9 @@ def main(argv=None):
 
     sub.add_parser("list", help="list copies")
 
+    sub.add_parser("subvol", help="turn the repo folder into a btrfs "
+                   "subvolume in place, so awa new snapshots it")
+
     sub.add_parser("log", help="git log refs/awa/record in the repo's store; "
                    "other arguments go to git log")
 
@@ -1747,7 +1974,7 @@ def main(argv=None):
     a, extra = p.parse_known_args(argv)
     if extra and a.cmd != "log":
         p.error(f"unrecognized arguments: {' '.join(extra)}")
-    if a.cmd not in ("record", "update"):
+    if a.cmd not in ("record", "update", "subvol"):
         background_update()
     try:
         if a.cmd == "update":
@@ -1771,6 +1998,8 @@ def main(argv=None):
             return 0 if ws_sync(repo, dest) else 1
         elif a.cmd == "list":
             ws_list(a.repo)
+        elif a.cmd == "subvol":
+            ws_subvol(a.repo)
         elif a.cmd == "rm":
             ws_rm(a.repo, a.name, a.force)
         elif a.cmd == "store":

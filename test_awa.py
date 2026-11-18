@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for awa. Run: python3 test_awa.py (one file, one process)."""
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -740,6 +741,141 @@ class Workspaces(Base):
         (self.tmp / ".proj@w1.merging").mkdir()
         self.assertEqual(self.awa("merge", "w1"), 1)
         self.assertTrue((w1 / "m.txt").exists())
+
+
+ON_BTRFS = (BASE.mkdir(parents=True, exist_ok=True) or
+            awa.fs_type(BASE) == "btrfs") and bool(shutil.which("btrfs"))
+
+FAILING_BTRFS_DELETE = """#!/bin/sh
+[ "$1 $2" = "subvolume delete" ] && { echo "Operation not permitted" >&2; exit 1; }
+exec %s "$@"
+"""
+
+
+@unittest.skipUnless(ON_BTRFS, "needs btrfs and btrfs-progs")
+class Subvolumes(Base):
+    def setUp(self):
+        super().setUp()
+        self.cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        super().tearDown()
+
+    def test_subvol_then_new_snapshots_merge_rm(self):
+        (self.repo / "node_modules").mkdir()
+        (self.repo / "node_modules" / "x.js").write_text("x")
+        os.symlink("a.txt", self.repo / "link")
+        sh("git add link && git commit -qm link", self.repo)
+        head = self.head()
+        self.assertFalse(awa.is_subvol(self.repo))
+        self.assertEqual(self.awa("subvol"), 0)
+        self.assertTrue(awa.is_subvol(self.repo))
+        self.assertEqual(self.head(), head)
+        self.assertEqual(sh("git status --porcelain", self.repo), "")
+        self.assertEqual(os.readlink(self.repo / "link"), "a.txt")
+        self.assertEqual((self.repo / "node_modules" / "x.js").read_text(), "x")
+        self.assertEqual(list(self.tmp.glob(".proj@*")), [])  # no leftovers
+        self.assertEqual(self.awa("subvol"), 0)  # already one: no-op
+        (self.tmp / ".proj@awa-old").mkdir()  # an interrupted cleanup
+        self.assertEqual(self.awa("subvol"), 0)
+        self.assertTrue((self.tmp / ".proj@awa-old").exists())  # kept
+        (self.tmp / ".proj@awa-old").rmdir()
+        w = self.ws("w")
+        self.assertTrue(awa.is_subvol(w))
+        self.assertEqual(sh("git branch --show-current", w), "awa/w")
+        self.assertTrue((w / "node_modules" / "x.js").exists())
+        sh("echo b > b.txt && git add -A && git commit -qm b", w)
+        self.assertEqual(self.awa("merge", "w"), 0)
+        self.assertTrue((self.repo / "b.txt").exists())
+        self.assertEqual(self.awa("rm", "w"), 0)
+        self.assertFalse(os.path.lexists(w))
+        self.assertFalse(list(self.tmp.glob(".proj@*")))  # merge copy gone
+
+    def test_rm_deletes_files_when_subvolume_delete_is_refused(self):
+        self.assertEqual(self.awa("subvol"), 0)
+        w = self.ws("w")
+        bin_ = self.tmp / "bin"
+        bin_.mkdir()
+        (bin_ / "btrfs").write_text(FAILING_BTRFS_DELETE
+                                    % shutil.which("btrfs"))
+        (bin_ / "btrfs").chmod(0o755)
+        path = os.environ["PATH"]
+        os.environ["PATH"] = f"{bin_}:{path}"
+        try:
+            self.assertEqual(self.awa("rm", "w"), 0)
+        finally:
+            os.environ["PATH"] = path
+        self.assertFalse(os.path.lexists(w))
+
+    def test_new_on_plain_folder_is_a_reflink_copy(self):
+        w = self.ws("w")
+        self.assertFalse(awa.is_subvol(w))
+        self.assertEqual(sh("git branch --show-current", w), "awa/w")
+
+    def assert_refused(self):
+        with self.assertRaises(SystemExit):
+            self.awa("subvol")
+        self.assertFalse(awa.is_subvol(self.repo))
+        self.assertEqual(list(self.tmp.glob(".proj@*")), [])
+
+    def test_subvol_names_the_old_folder_if_the_repo_is_missing(self):
+        old = self.tmp / ".proj@awa-old"
+        self.repo.rename(old)
+        with self.assertRaises(SystemExit):
+            self.awa("subvol")
+        self.assertTrue((old / ".git").exists())
+
+    def holder(self, code):
+        """A child process that runs code, prints ready and waits."""
+        p = subprocess.Popen(
+            [sys.executable, "-c", f"import sys; sys.path.insert(0, "
+             f"{str(Path(__file__).parent)!r}); import awa\n{code}\n"
+             "print('ready', flush=True); sys.stdin.read()"],
+            cwd=self.tmp, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True)
+        self.assertEqual(p.stdout.readline().strip(), "ready")
+        return p
+
+    def check_refused_while(self, code):
+        p = self.holder(code)
+        try:
+            self.assert_refused()
+        finally:
+            p.stdin.close()
+            p.wait()
+            p.stdout.close()
+        self.assertEqual(self.awa("subvol"), 0)  # fine once it is gone
+
+    def test_subvol_refuses_open_files(self):
+        self.check_refused_while(f"f = open({str(self.repo / 'a.txt')!r})")
+
+    def test_subvol_refuses_a_process_inside(self):
+        self.check_refused_while(f"import os; os.chdir({str(self.repo)!r})")
+
+    def test_subvol_refuses_inotify_watches(self):
+        self.check_refused_while(f"w = awa.Watcher({str(self.repo)!r})")
+
+    def test_subvol_refuses_inotify_watch_on_a_file(self):
+        self.check_refused_while(
+            "import ctypes, os; libc = ctypes.CDLL(None, use_errno=True); "
+            "fd = libc.inotify_init1(0); "
+            f"assert libc.inotify_add_watch(fd, {str(self.repo / 'a.txt')!r}"
+            ".encode(), 2) >= 0")
+
+
+class SubvolElsewhere(Base):
+    @unittest.skipUnless(os.path.isdir("/dev/shm")
+                         and awa.fs_type("/dev/shm") not in ("btrfs", ""),
+                         "needs a non-btrfs /dev/shm")
+    def test_subvol_refuses_other_filesystems(self):
+        d = Path(tempfile.mkdtemp(dir="/dev/shm"))
+        try:
+            sh("git init -q", d)
+            with self.assertRaises(SystemExit):
+                awa.main(["-C", str(d), "subvol"])
+        finally:
+            shutil.rmtree(d)
 
 
 FAKE_RESTIC = r"""#!/usr/bin/env python3
