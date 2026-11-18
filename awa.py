@@ -1312,12 +1312,14 @@ def stage_stores(root, stage):
             except RuntimeError:
                 if (src / "HEAD").exists():
                     raise
-            if before is None or not (src / "HEAD").exists():
+            if not (src / "HEAD").exists():
                 shutil.rmtree(dest, ignore_errors=True)  # removed meanwhile
                 break
             for f in dest.rglob("*.lock"):
                 f.unlink(missing_ok=True)
-            if store_refs(src) != before:
+            if before is None:
+                why = "git can't read its refs"
+            elif store_refs(src) != before:
                 why = "its refs changed while it was copied"
             elif store_refs(dest) != before:
                 why = "the copy's refs differ from the store's"
@@ -1498,10 +1500,15 @@ def main(argv=None):
     g.add_argument("--start", action="store_true",
                    help="back up hourly and prune weekly (systemd timers)")
     g.add_argument("--stop", action="store_true", help="stop the timers")
-    g.add_argument("--restic", nargs=argparse.REMAINDER, metavar="ARGS",
+    g.add_argument("--restic", action="store_true",
                    help="run restic with the backup settings; every "
                    "argument after --restic goes to restic")
 
+    argv = list(sys.argv[1:] if argv is None else argv)
+    restic_args = []
+    if "--restic" in argv and "backup" in argv[:argv.index("--restic")]:
+        i = argv.index("--restic") + 1
+        argv, restic_args = argv[:i], argv[i:]  # verbatim, even -- and -h
     a, extra = p.parse_known_args(argv)
     if extra and a.cmd != "log":
         p.error(f"unrecognized arguments: {' '.join(extra)}")
@@ -1534,8 +1541,8 @@ def main(argv=None):
         elif a.cmd == "store":
             print(open_store(toplevel(a.repo)))
         elif a.cmd == "backup":
-            if a.restic is not None:
-                return restic(backup_env(), *a.restic)
+            if a.restic:
+                return restic(backup_env(), *restic_args)
             if a.start:
                 backup_start()
             elif a.stop:

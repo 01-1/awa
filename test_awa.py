@@ -699,6 +699,15 @@ class Backup(Base):
         self.assertEqual(awa.main(["backup"]), 1)
         self.assertEqual(len(self.calls()), 1)
 
+    def test_store_whose_refs_cant_be_read_is_kept_and_reported(self):
+        awa.snapshot(self.repo)
+        with open(awa.store_dir(self.repo) / "config", "a") as f:
+            f.write("[broken\n")
+        self.assertEqual(awa.main(["backup"]), 1)
+        rel = str(awa.store_dir(self.repo).relative_to(
+            awa.data_home() / "awa"))
+        self.assertIn(f"{rel}/HEAD", self.calls()[0]["files"])
+
     def test_restic_failure_fails(self):
         awa.snapshot(self.repo)
         os.environ["FAKE_RESTIC_EXIT"] = "1"
@@ -730,7 +739,7 @@ class Backup(Base):
                          ["cat", "cat", "init"])
 
     def test_restic_passthrough(self):
-        args = ["snapshots", "--tag", "awa", "--prune", "--help"]
+        args = ["snapshots", "--tag", "awa", "--prune", "--help", "--", "-x"]
         self.assertEqual(awa.main(["backup", "--restic", *args]), 0)
         self.assertEqual(self.calls()[0]["argv"], args)
 
