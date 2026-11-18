@@ -742,6 +742,21 @@ class Backup(Base):
         args = ["snapshots", "--tag", "awa", "--prune", "--help", "--", "-x"]
         self.assertEqual(awa.main(["backup", "--restic", *args]), 0)
         self.assertEqual(self.calls()[0]["argv"], args)
+        self.assertEqual(awa.main(["-C", "backup", "backup", "--restic",
+                                   "x"]), 0)
+        self.assertEqual(self.calls()[1]["argv"], ["x"])
+        awa.snapshot(self.repo)
+        real, ran = awa.subprocess.run, []
+
+        def run(cmd, *a, **k):
+            ran.append(cmd)
+            return real(cmd, *a, **k)
+        awa.subprocess.run = run  # only backup splits at --restic
+        try:
+            self.awa("log", "--", "backup", "--restic", "x")
+        finally:
+            awa.subprocess.run = real
+        self.assertEqual(ran[-1][-4:], ["--", "backup", "--restic", "x"])
 
     def test_needs_config(self):
         self.cfg.unlink()

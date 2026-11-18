@@ -1506,8 +1506,11 @@ def main(argv=None):
 
     argv = list(sys.argv[1:] if argv is None else argv)
     restic_args = []
-    if "--restic" in argv and "backup" in argv[:argv.index("--restic")]:
-        i = argv.index("--restic") + 1
+    i = 0  # the subcommand: the first word that isn't an option or -C's value
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] == "-C" else 1
+    if argv[i:i + 1] == ["backup"] and "--restic" in argv[i:]:
+        i = argv.index("--restic", i) + 1
         argv, restic_args = argv[:i], argv[i:]  # verbatim, even -- and -h
     a, extra = p.parse_known_args(argv)
     if extra and a.cmd != "log":
