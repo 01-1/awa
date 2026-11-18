@@ -75,6 +75,63 @@ named like dependency or build caches (`node_modules`, `.venv` and the
 like), repos that have their own recorder (`awa record --start`,
 `awa new --record`), and repos with a file `.git/awa-norecord`.
 
+## Backups
+
+`awa backup` backs up every history store (all of `~/.local/share/awa`)
+off the machine with [restic](https://restic.net). Settings live in
+`~/.config/awa/backup.env`, one `KEY=VALUE` per line (`export ` and quotes
+allowed; comments only on their own `#` lines). Secrets stay in files it
+points to, and none go on a command line:
+
+```bash
+# any restic repository
+RESTIC_REPOSITORY=b2:my-bucket:awa
+RESTIC_PASSWORD_FILE=~/credentials/restic/password
+# optional: a KEY=VALUE file of provider keys, such as B2_ACCOUNT_ID
+AWA_BACKUP_ENV_FILE=~/credentials/backblaze/b2.env
+# optional: snapshot host (default: the hostname), forget policy for --prune
+#AWA_BACKUP_HOST=laptop
+#AWA_BACKUP_KEEP=--keep-daily 30 --keep-weekly 26
+```
+
+```bash
+awa backup --init       # create the restic repository if it doesn't exist
+awa backup              # back up now
+awa backup --start      # hourly backup, weekly prune (systemd user timers)
+awa backup --stop
+awa backup --prune      # forget old backups, then prune
+awa backup --restic snapshots   # any restic command with these settings
+```
+
+Snapshots carry the tag `awa` and the host, and `--prune` only forgets
+snapshots with both. It keeps 48 hourly, 30 daily, 26 weekly and 24
+monthly snapshots. It never repacks (`--max-unused unlimited
+--repack-cacheable-only --max-repack-size 0`): it deletes only packs that
+nothing uses, so it downloads no pack data, which matters where downloads are capped (B2).
+Backups and prunes take one lock, so they never overlap: a backup that
+finds the lock taken skips that hour, and a prune waits.
+
+**Consistency.** Stores keep changing while recorders run: a snapshot
+writes its objects and then moves its ref, and `git gc` writes a new pack
+and then deletes what it replaced, and packs loose refs, then deletes
+them. A plain file-by-file backup can catch a ref whose objects it
+missed, or miss a ref. So `awa backup` first copies each store to
+`~/.local/state/awa/backup-stage` (reflinks on btrfs/XFS: no extra space;
+about 5 s for 4 GB of stores). A copy is kept only if its refs equal the
+store's just before and just after copying, and
+`git fsck --connectivity-only` finds every object they need; otherwise
+the store is copied again. restic then reads the checked copies, and they
+are deleted. A store with no such copy after 5 tries (broken at the
+source, or rewritten nonstop) is backed up as copied and `awa backup`
+exits 1, naming it; earlier snapshots keep its last good version.
+
+Snapshots hold the stores under the staging path. To restore them:
+
+```bash
+awa backup --restic restore "latest:$HOME/.local/state/awa/backup-stage" \
+  --tag awa --host "$(hostname)" --target /tmp/awa-restore
+```
+
 ## Ignoring folders: .awaignore
 
 `.awaignore` in a repo, and `~/.config/awa/ignore` for every repo, hold
@@ -107,7 +164,8 @@ checkout has local changes or commits the upstream lacks. Turn this off
 with `touch ~/.config/awa/no-auto-update` (or `AWA_NO_AUTO_UPDATE=1`);
 `awa update` updates now either way.
 
-Python 3.9+, git 2.38+, Linux, systemd (only for `record --start`). No packages.
+Python 3.9+, git 2.38+, Linux, systemd (only for `record --start` and
+`backup --start`), restic (only for `backup`). No packages.
 Tests: `python3 test_awa.py` (uses `~/.cache/awa-test`, or `AWA_TEST_DIR`).
 
 ## Limits

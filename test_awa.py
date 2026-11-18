@@ -561,5 +561,223 @@ class Workspaces(Base):
         self.assertTrue((w1 / "m.txt").exists())
 
 
+FAKE_RESTIC = r"""#!/usr/bin/env python3
+import json, os, subprocess, sys
+rec = {"argv": sys.argv[1:],
+       "env": {k: os.environ.get(k) for k in (
+           "RESTIC_REPOSITORY", "RESTIC_PASSWORD_FILE", "B2_ACCOUNT_ID",
+           "B2_ACCOUNT_KEY")}}
+if sys.argv[1:2] == ["backup"]:
+    top = sys.argv[-1]
+    rec["files"] = sorted(os.path.relpath(os.path.join(d, f), top)
+                          for d, _, fs in os.walk(top) for f in fs)
+    rec["fsck"] = {
+        os.path.relpath(d, top): subprocess.run(
+            ["git", "--git-dir", d, "fsck", "--connectivity-only"],
+            capture_output=True).returncode
+        for d, _, fs in os.walk(top) if d.endswith(".git") and "HEAD" in fs}
+with open(os.environ["FAKE_RESTIC_LOG"], "a") as f:
+    f.write(json.dumps(rec) + "\n")
+if sys.argv[1:3] == ["cat", "config"]:
+    sys.exit(int(os.environ.get("FAKE_RESTIC_CAT", "0")))
+sys.exit(int(os.environ.get("FAKE_RESTIC_EXIT", "0")))
+"""
+
+FAKE_SYSTEMCTL = """#!/bin/sh
+echo "$@" >> "$FAKE_SYSTEMCTL_LOG"
+"""
+
+
+class Backup(Base):
+    def setUp(self):
+        super().setUp()
+        self.saved = {k: os.environ.get(k) for k in (
+            "PATH", "XDG_STATE_HOME", "FAKE_RESTIC_LOG", "FAKE_RESTIC_CAT",
+            "FAKE_RESTIC_EXIT", "FAKE_SYSTEMCTL_LOG")}
+        os.environ["XDG_STATE_HOME"] = str(self.tmp / "state")
+        self.log = self.tmp / "restic.log"
+        os.environ["FAKE_RESTIC_LOG"] = str(self.log)
+        bin_ = self.tmp / "bin"
+        bin_.mkdir()
+        for name, text in (("restic", FAKE_RESTIC),
+                           ("systemctl", FAKE_SYSTEMCTL)):
+            (bin_ / name).write_text(text)
+            (bin_ / name).chmod(0o755)
+        os.environ["PATH"] = f"{bin_}:{os.environ['PATH']}"
+        creds = self.tmp / "b2.env"
+        creds.write_text("export B2_ACCOUNT_ID=id123\nB2_ACCOUNT_KEY='s3cret'\n")
+        cfg = Path(os.environ["XDG_CONFIG_HOME"]) / "awa" / "backup.env"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(f"# test\nRESTIC_REPOSITORY=b2:bucket:awa\n"
+                       f"RESTIC_PASSWORD_FILE={self.tmp}/pw\n"
+                       f"AWA_BACKUP_ENV_FILE={creds}\nAWA_BACKUP_HOST=h1\n")
+        self.cfg = cfg
+        self.retry = awa.BACKUP_RETRY_SECONDS
+        awa.BACKUP_RETRY_SECONDS = 0
+
+    def tearDown(self):
+        awa.BACKUP_RETRY_SECONDS = self.retry
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def calls(self):
+        import json
+        if not self.log.exists():
+            return []
+        return [json.loads(x) for x in self.log.read_text().splitlines()]
+
+    def loose(self, st, commit):
+        return st / "objects" / commit[:2] / commit[2:]
+
+    def test_backs_up_a_checked_copy_with_tag_host_and_env(self):
+        awa.snapshot(self.repo)
+        self.assertEqual(awa.main(["backup"]), 0)
+        (c,) = self.calls()
+        argv = c["argv"]
+        self.assertEqual(argv[0], "backup")
+        for a, b in (("--tag", "awa"), ("--host", "h1")):
+            self.assertEqual(argv[argv.index(a) + 1], b)
+        self.assertIn("--ignore-inode", argv)
+        self.assertEqual(argv[-1], str(awa.backup_stage()))
+        self.assertNotIn("s3cret", " ".join(argv))
+        self.assertEqual(c["env"], {
+            "RESTIC_REPOSITORY": "b2:bucket:awa",
+            "RESTIC_PASSWORD_FILE": f"{self.tmp}/pw",
+            "B2_ACCOUNT_ID": "id123", "B2_ACCOUNT_KEY": "s3cret"})
+        rel = str(awa.store_dir(self.repo).relative_to(
+            awa.data_home() / "awa"))
+        self.assertIn(f"{rel}/HEAD", c["files"])
+        self.assertEqual(c["fsck"], {rel: 0})
+        self.assertFalse(awa.backup_stage().exists())
+
+    def test_copy_caught_mid_write_is_copied_again(self):
+        commit = awa.snapshot(self.repo)
+        real = awa.copy_tree
+        seen = []
+
+        def racy(src, dest):  # the first copy gets the ref, not the commit
+            real(src, dest)
+            seen.append(dest)
+            if len(seen) == 1:
+                self.loose(dest, commit).unlink()
+        awa.copy_tree = racy
+        try:
+            self.assertEqual(awa.main(["backup"]), 0)
+        finally:
+            awa.copy_tree = real
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(list(self.calls()[0]["fsck"].values()), [0])
+
+    def test_copy_that_missed_a_ref_is_copied_again(self):
+        awa.snapshot(self.repo)
+        real = awa.copy_tree
+        seen = []
+
+        def racy(src, dest):  # as if pack-refs ran: the loose ref is missed
+            real(src, dest)
+            seen.append(dest)
+            (dest / "refs" / "awa" / "record.lock").write_text("")
+            if len(seen) == 1:
+                (dest / "refs" / "awa" / "record").unlink()
+        awa.copy_tree = racy
+        try:
+            self.assertEqual(awa.main(["backup"]), 0)
+        finally:
+            awa.copy_tree = real
+        self.assertEqual(len(seen), 2)
+        files = self.calls()[0]["files"]
+        self.assertTrue(any(f.endswith("/refs/awa/record") for f in files))
+        self.assertFalse(any(f.endswith(".lock") for f in files))
+
+    def test_store_broken_at_the_source_fails_loudly_but_is_backed_up(self):
+        commit = awa.snapshot(self.repo)
+        self.loose(awa.store_dir(self.repo), commit).unlink()
+        self.assertEqual(awa.main(["backup"]), 1)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_store_whose_refs_cant_be_read_is_kept_and_reported(self):
+        awa.snapshot(self.repo)
+        with open(awa.store_dir(self.repo) / "config", "a") as f:
+            f.write("[broken\n")
+        self.assertEqual(awa.main(["backup"]), 1)
+        rel = str(awa.store_dir(self.repo).relative_to(
+            awa.data_home() / "awa"))
+        self.assertIn(f"{rel}/HEAD", self.calls()[0]["files"])
+
+    def test_restic_failure_fails(self):
+        awa.snapshot(self.repo)
+        os.environ["FAKE_RESTIC_EXIT"] = "1"
+        self.assertEqual(awa.main(["backup"]), 1)
+        self.assertFalse(awa.backup_stage().exists())
+
+    def test_skips_while_a_backup_or_prune_runs(self):
+        awa.snapshot(self.repo)
+        with awa.backup_lock(wait=False):
+            self.assertEqual(awa.main(["backup"]), 0)
+        self.assertEqual(self.calls(), [])
+
+    def test_prune_is_scoped_and_never_repacks(self):
+        self.assertEqual(awa.main(["backup", "--prune"]), 0)
+        argv = self.calls()[0]["argv"]
+        self.assertEqual(argv[:6], ["forget", "--prune", "--host", "h1",
+                                    "--tag", "awa"])
+        self.assertEqual(argv[-5:], ["--max-unused", "unlimited",
+                                     "--repack-cacheable-only",
+                                     "--max-repack-size", "0"])
+        self.assertIn("--keep-daily", argv)
+
+    def test_init_only_when_missing(self):
+        os.environ["FAKE_RESTIC_CAT"] = "0"
+        self.assertEqual(awa.main(["backup", "--init"]), 0)
+        os.environ["FAKE_RESTIC_CAT"] = "10"
+        self.assertEqual(awa.main(["backup", "--init"]), 0)
+        self.assertEqual([c["argv"][0] for c in self.calls()],
+                         ["cat", "cat", "init"])
+
+    def test_restic_passthrough(self):
+        args = ["snapshots", "--tag", "awa", "--prune", "--help", "--", "-x"]
+        self.assertEqual(awa.main(["backup", "--restic", *args]), 0)
+        self.assertEqual(self.calls()[0]["argv"], args)
+        self.assertEqual(awa.main(["-C", "backup", "backup", "--restic",
+                                   "x"]), 0)
+        self.assertEqual(self.calls()[1]["argv"], ["x"])
+        awa.snapshot(self.repo)
+        real, ran = awa.subprocess.run, []
+
+        def run(cmd, *a, **k):
+            ran.append(cmd)
+            return real(cmd, *a, **k)
+        awa.subprocess.run = run  # only backup splits at --restic
+        try:
+            self.awa("log", "--", "backup", "--restic", "x")
+        finally:
+            awa.subprocess.run = real
+        self.assertEqual(ran[-1][-4:], ["--", "backup", "--restic", "x"])
+
+    def test_needs_config(self):
+        self.cfg.unlink()
+        with self.assertRaises(SystemExit):
+            awa.main(["backup"])
+        self.assertEqual(self.calls(), [])
+
+    def test_start_and_stop_timers(self):
+        os.environ["FAKE_SYSTEMCTL_LOG"] = str(self.tmp / "systemctl.log")
+        self.assertEqual(awa.main(["backup", "--start"]), 0)
+        d = Path(os.environ["XDG_CONFIG_HOME"]) / "systemd" / "user"
+        svc = (d / "awa-backup.service").read_text()
+        self.assertIn(f"{os.path.abspath(awa.__file__)} backup\n", svc)
+        self.assertIn("backup --prune\n",
+                      (d / "awa-backup-prune.service").read_text())
+        self.assertIn("OnCalendar=hourly", (d / "awa-backup.timer").read_text())
+        self.assertIn("enable --now awa-backup.timer awa-backup-prune.timer",
+                      (self.tmp / "systemctl.log").read_text())
+        self.assertEqual(awa.main(["backup", "--stop"]), 0)
+        self.assertFalse(any((d / u).exists() for u in awa.BACKUP_UNITS))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

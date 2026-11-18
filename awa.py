@@ -11,6 +11,8 @@ Workspaces for running several coding agents on one git repo:
   merge   Merge a copy's branch and run a test in a temporary copy, then
           fast-forward the repo; bring the copy up to date.
   log     Show a repo's recorded history (git log arguments pass through).
+  backup  Back up every history store with restic, from a checked copy;
+          --prune forgets old backups without downloading pack data.
 
 Standard library only. Linux only (inotify via ctypes).
 """
@@ -22,7 +24,9 @@ import fcntl
 import hashlib
 import os
 import select
+import shlex
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -1143,6 +1147,300 @@ def background_update():
         pass
 
 
+# ---------------------------------------------------------------- backup
+
+BACKUP_TAG = "awa"
+# restic forget policy; AWA_BACKUP_KEEP in backup.env replaces it
+BACKUP_KEEP = ("--keep-hourly 48 --keep-daily 30 --keep-weekly 26 "
+               "--keep-monthly 24")
+BACKUP_TRIES = 5            # copies of a store that fails its check
+BACKUP_RETRY_SECONDS = 1.0  # wait before copying it again
+BACKUP_UNITS = ("awa-backup.service", "awa-backup.timer",
+                "awa-backup-prune.service", "awa-backup-prune.timer")
+
+
+def state_home():
+    return Path(os.environ.get("XDG_STATE_HOME")
+                or Path.home() / ".local" / "state")
+
+
+def backup_config():
+    return config_home() / "awa" / "backup.env"
+
+
+def backup_stage():
+    """Where `awa backup` puts the checked copy restic reads. Fixed, so
+    restic finds its parent snapshot and only reads changed files."""
+    return state_home() / "awa" / "backup-stage"
+
+
+def read_env_file(path):
+    """KEY=VALUE lines (an `export ` prefix, quotes and # comments allowed)
+    as a dict. Values may be secrets: never print them."""
+    out = {}
+    for n, line in enumerate(Path(path).read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or not key.isidentifier():
+            raise RuntimeError(f"{path}:{n}: expected KEY=VALUE")
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+
+def backup_env():
+    """Variables for restic: ~/.config/awa/backup.env, plus the provider
+    credentials file it names in AWA_BACKUP_ENV_FILE (backup.env wins)."""
+    path = backup_config()
+    if not path.exists():
+        raise RuntimeError(f"no backup config; create {path} "
+                           "(see the README, Backups)")
+    cfg = read_env_file(path)
+    for k in ("RESTIC_PASSWORD_FILE", "AWA_BACKUP_ENV_FILE",
+              "AWA_BACKUP_RESTIC"):
+        if cfg.get(k):
+            cfg[k] = os.path.expanduser(cfg[k])
+    if cfg.get("AWA_BACKUP_ENV_FILE"):
+        cfg = {**read_env_file(cfg["AWA_BACKUP_ENV_FILE"]), **cfg}
+    if not cfg.get("RESTIC_REPOSITORY"):
+        raise RuntimeError(f"{path}: RESTIC_REPOSITORY is not set")
+    if not any(cfg.get(k) for k in ("RESTIC_PASSWORD_FILE", "RESTIC_PASSWORD",
+                                    "RESTIC_PASSWORD_COMMAND")):
+        raise RuntimeError(f"{path}: RESTIC_PASSWORD_FILE is not set")
+    return cfg
+
+
+def backup_host(cfg):
+    return cfg.get("AWA_BACKUP_HOST") or socket.gethostname()
+
+
+def restic(cfg, *args, quiet=False):
+    """Run restic with cfg in its environment (secrets never go on the
+    command line). Returns its exit code."""
+    exe = cfg.get("AWA_BACKUP_RESTIC") or "restic"
+    out = subprocess.DEVNULL if quiet else None
+    try:
+        return subprocess.run([exe, *args], env={**os.environ, **cfg},
+                              stdout=out, stderr=out).returncode
+    except FileNotFoundError:
+        raise RuntimeError(f"{exe} not found; install restic")
+
+
+def backup_lock(wait):
+    """The lock that keeps backups and prunes from overlapping, or None if
+    it is taken and wait is False."""
+    p = state_home() / "awa" / "backup.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    f = open(p, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
+def copy_tree(src, dest):
+    """Replace dest with a copy of src (reflinks where the filesystem has
+    them). Files that vanish mid-copy are fine: the copy is checked."""
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["cp", "-a", "--reflink=auto", "--", str(src),
+                        str(dest)], capture_output=True, text=True)
+    if not dest.exists():
+        raise RuntimeError(f"copying {src} failed: {r.stderr.strip()}")
+
+
+def store_dirs(root):
+    """The history stores (bare repos named *.git) under root."""
+    found = []
+    for d, subdirs, files in os.walk(root):
+        if d.endswith(".git") and "HEAD" in files and "objects" in subdirs:
+            found.append(Path(d))
+            subdirs[:] = []
+    return sorted(found)
+
+
+def store_problem(st):
+    """Why the store at st is broken ('' if it isn't): any ref or reflog
+    entry naming an object it doesn't have."""
+    r = git("--git-dir", str(st), "fsck", "--connectivity-only",
+            "--no-dangling", "--no-progress", cwd="/", check=False)
+    if r.returncode == 0:
+        return ""
+    lines = (r.stderr or r.stdout).strip().splitlines()
+    return lines[0] if lines else f"git fsck exit {r.returncode}"
+
+
+def store_refs(st):
+    """The refs of the store at st with their object ids, or None if it
+    can't be read (gone)."""
+    r = git("--git-dir", str(st), "for-each-ref",
+            "--format=%(objectname) %(refname)", cwd="/", check=False)
+    return r.stdout if r.returncode == 0 else None
+
+
+def stage_stores(root, stage):
+    """Copy each store under root to stage, as it was at one moment.
+
+    Stores change while they are copied: a snapshot writes objects, then
+    moves its ref; `git gc` writes a new pack, then deletes what it
+    replaced, and packs loose refs into packed-refs, then deletes them. A
+    copy can catch a ref without its objects, miss a pack, or miss a ref.
+    So a copy is kept only when its refs equal the store's just before and
+    just after copying it, and `git fsck --connectivity-only` finds every
+    object they need; otherwise the store is copied again. Leftover lock
+    files are dropped from copies. Returns [(store, problem)] for stores
+    with no such copy after BACKUP_TRIES tries; they are staged as copied.
+    """
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True)
+    bad = []
+    for src in store_dirs(root):
+        rel = src.relative_to(root)
+        dest = stage / rel
+        for attempt in range(1, BACKUP_TRIES + 1):
+            before = store_refs(src)
+            try:
+                copy_tree(src, dest)
+            except RuntimeError:
+                if (src / "HEAD").exists():
+                    raise
+            if not (src / "HEAD").exists():
+                shutil.rmtree(dest, ignore_errors=True)  # removed meanwhile
+                break
+            for f in dest.rglob("*.lock"):
+                f.unlink(missing_ok=True)
+            if before is None:
+                why = "git can't read its refs"
+            elif store_refs(src) != before:
+                why = "its refs changed while it was copied"
+            elif store_refs(dest) != before:
+                why = "the copy's refs differ from the store's"
+            else:
+                why = store_problem(dest)
+            if not why:
+                break
+            if attempt == BACKUP_TRIES:
+                bad.append((rel, why))
+                break
+            time.sleep(BACKUP_RETRY_SECONDS)
+    return bad
+
+
+def backup_run():
+    """Back up every history store with restic, from a checked copy."""
+    cfg = backup_env()
+    root = data_home() / "awa"
+    if not root.is_dir():
+        raise RuntimeError(f"no history stores in {root}")
+    lock = backup_lock(wait=False)
+    if lock is None:
+        print("awa: another awa backup or prune is running; skipping")
+        return 0
+    with lock:
+        stage = backup_stage()
+        try:
+            bad = stage_stores(root, stage)
+            args = ["backup", "--tag", BACKUP_TAG, "--host", backup_host(cfg),
+                    "--ignore-inode", "--skip-if-unchanged"]
+            code = restic(cfg, *args, str(stage))
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    for rel, why in bad:
+        print(f"awa: no consistent copy of {root / rel} ({why}); backed "
+              "it up as copied", file=sys.stderr)
+    if code != 0:
+        print(f"awa: restic backup failed (exit {code})", file=sys.stderr)
+    return 1 if code or bad else 0
+
+
+def backup_prune():
+    """Forget old awa snapshots of this host and prune, without ever
+    downloading pack data: nothing is repacked, and only packs nothing
+    uses are deleted."""
+    cfg = backup_env()
+    keep = (cfg.get("AWA_BACKUP_KEEP") or BACKUP_KEEP).split()
+    with backup_lock(wait=True):
+        return restic(cfg, "forget", "--prune", "--host", backup_host(cfg),
+                      "--tag", BACKUP_TAG, *keep, "--max-unused", "unlimited",
+                      "--repack-cacheable-only", "--max-repack-size", "0")
+
+
+def backup_init():
+    """Create the restic repository unless it exists."""
+    cfg = backup_env()
+    code = restic(cfg, "cat", "config", quiet=True)
+    if code == 0:
+        print(f"awa: {cfg['RESTIC_REPOSITORY']} already exists")
+        return 0
+    if code != 10:  # 10: the repository does not exist
+        raise RuntimeError(f"can't tell whether {cfg['RESTIC_REPOSITORY']} "
+                           f"exists (restic exit {code})")
+    return restic(cfg, "init")
+
+
+def backup_unit_files():
+    """{file name: text} of the backup units: hourly backup, weekly prune."""
+    cmd = shlex.join([sys.executable, os.path.abspath(__file__), "backup"])
+    path = os.environ.get("PATH") or "/usr/bin:/bin"
+
+    def service(desc, arg, timeout):
+        return (f"[Unit]\nDescription=awa: {desc}\n\n[Service]\n"
+                f"Type=oneshot\nEnvironment=\"PATH={path}\"\n"
+                f"ExecStart={cmd}{arg}\nNice=10\nIOSchedulingClass=idle\n"
+                f"TimeoutStartSec={timeout}\n")
+
+    def timer(desc, when, delay):
+        return (f"[Unit]\nDescription=awa: {desc}\n\n[Timer]\n"
+                f"OnCalendar={when}\nRandomizedDelaySec={delay}\n"
+                "Persistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    return dict(zip(BACKUP_UNITS, (
+        service("back up the history stores with restic", "", "6h"),
+        timer("hourly backup of the history stores", "hourly", "5min"),
+        service("forget old backups and prune (no pack downloads)",
+                " --prune", "2h"),
+        timer("weekly prune of the history store backups", "weekly", "1h"))))
+
+
+def systemctl(*args):
+    r = subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                       text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"systemctl --user {' '.join(args)} failed: "
+                           f"{r.stderr.strip()}")
+
+
+def backup_start():
+    backup_env()  # refuse to schedule backups that can't run
+    d = config_home() / "systemd" / "user"
+    d.mkdir(parents=True, exist_ok=True)
+    for name, text in backup_unit_files().items():
+        _write_if_changed(d / name, text)
+    systemctl("daemon-reload")
+    systemctl("enable", "--now", *[u for u in BACKUP_UNITS
+                                   if u.endswith(".timer")])
+    print("awa: backups scheduled: hourly (awa-backup.timer), prune weekly "
+          "(awa-backup-prune.timer); logs: journalctl --user -u awa-backup")
+
+
+def backup_stop():
+    timers = [u for u in BACKUP_UNITS if u.endswith(".timer")]
+    subprocess.run(["systemctl", "--user", "disable", "--now", *timers],
+                   capture_output=True)
+    d = config_home() / "systemd" / "user"
+    for name in BACKUP_UNITS:
+        (d / name).unlink(missing_ok=True)
+    systemctl("daemon-reload")
+    print("awa: backups unscheduled (a backup already running finishes)")
+
+
 # ---------------------------------------------------------------- cli
 
 def main(argv=None):
@@ -1191,6 +1489,29 @@ def main(argv=None):
     u.add_argument("--quiet", action="store_true")
     u.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
 
+    b = sub.add_parser("backup", allow_abbrev=False,
+                       help="back up every history store with restic "
+                       "(settings: ~/.config/awa/backup.env)")
+    g = b.add_mutually_exclusive_group()
+    g.add_argument("--prune", action="store_true",
+                   help="forget old backups and prune, downloading no packs")
+    g.add_argument("--init", action="store_true",
+                   help="create the restic repository")
+    g.add_argument("--start", action="store_true",
+                   help="back up hourly and prune weekly (systemd timers)")
+    g.add_argument("--stop", action="store_true", help="stop the timers")
+    g.add_argument("--restic", action="store_true",
+                   help="run restic with the backup settings; every "
+                   "argument after --restic goes to restic")
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    restic_args = []
+    i = 0  # the subcommand: the first word that isn't an option or -C's value
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] == "-C" else 1
+    if argv[i:i + 1] == ["backup"] and "--restic" in argv[i:]:
+        i = argv.index("--restic", i) + 1
+        argv, restic_args = argv[:i], argv[i:]  # verbatim, even -- and -h
     a, extra = p.parse_known_args(argv)
     if extra and a.cmd != "log":
         p.error(f"unrecognized arguments: {' '.join(extra)}")
@@ -1222,6 +1543,19 @@ def main(argv=None):
             ws_rm(a.repo, a.name, a.force)
         elif a.cmd == "store":
             print(open_store(toplevel(a.repo)))
+        elif a.cmd == "backup":
+            if a.restic:
+                return restic(backup_env(), *restic_args)
+            if a.start:
+                backup_start()
+            elif a.stop:
+                backup_stop()
+            elif a.init:
+                return backup_init()
+            elif a.prune:
+                return backup_prune()
+            else:
+                return backup_run()
         elif a.cmd == "log":
             st = open_store(toplevel(a.repo))
             return subprocess.run(["git", "--git-dir", str(st), "log",
