@@ -245,7 +245,7 @@ def path_id(path):
 
 INDEX_SECONDS = 60.0  # how long a scan of the stores is reused
 _index = {}    # stores root -> (time, {store: {"path", "id", ...}})
-_checked = set()  # (stores root, store) whose repo this process has checked
+_checked = {}  # (stores root, store) -> id of the repo this process checked
 
 
 def _store_info(st):
@@ -369,10 +369,11 @@ def claim_store(repo, st, create=True):
     exists. A store at st that has another repo's id (that repo was moved
     away and this one took its place) is first renamed aside, for that repo
     to claim. Stores of repos nested in the moved one follow it. A store from
-    before awa kept ids matches when repo's HEAD reflog holds the commit
-    its last snapshot was taken at. A copy of a recorded repo (both still
-    present) gets an id of its own. Returns False if a store it should take
-    over was left behind, so that a later call tries again.
+    before awa kept ids matches when repo's HEAD reflog, and no other
+    recorded repo's, holds the commit its last snapshot was taken at. A copy
+    of a recorded repo (both still present) gets an id of its own. Returns
+    False if a store it should take over was left behind, so that a later
+    call tries again.
     """
     repo = Path(os.path.realpath(repo))
     gd = git_dir(repo)
@@ -390,18 +391,21 @@ def claim_store(repo, st, create=True):
                                  f"-{time.strftime('%Y%m%dT%H%M%S')}.git")
             try:
                 os.rename(st, aside)
-            except OSError as e:
-                print(f"awa: {repo}: could not set aside {st}: {e}",
-                      flush=True)
-                return False
+            except OSError as e:  # never write into another repo's history
+                raise RuntimeError(f"could not set aside {st}: {e}") from e
             idx.pop(str(st), None)
             idx[str(aside)] = here
             print(f"awa: {repo}: {st} holds the history of another repo "
                   f"once at this path; kept it as {aside}", flush=True)
-    reflog = None
+    reflogs = {}
+
+    def in_reflog(path, head):
+        if path not in reflogs:
+            reflogs[path] = set(git("reflog", "show", "--format=%H", "HEAD",
+                                    cwd=path, check=False).stdout.split())
+        return head in reflogs[path]
 
     def ours(s, i):
-        nonlocal reflog
         if s == str(st) or not i.get("path"):
             return False
         if i.get("id"):
@@ -409,12 +413,15 @@ def claim_store(repo, st, create=True):
         if _live(i):
             return False
         head = _last_head(s, i)
-        if not head:
+        if not head or not in_reflog(repo, head):
             return False
-        if reflog is None:
-            reflog = set(git("reflog", "show", "--format=%H", "HEAD",
-                             cwd=repo, check=False).stdout.split())
-        return head in reflog
+        others = [i2["path"] for i2 in list(idx.values()) if i2.get("path")
+                  and i2["path"] != str(repo) and _live(i2)]
+        if any(in_reflog(o, head) for o in others):
+            print(f"awa: {repo}: not taking over {s}: other repos share its "
+                  "last HEAD", flush=True)
+            return False
+        return True
 
     found = sorted((s for s, i in idx.items() if ours(s, i)),
                    key=lambda s: _tip_time(s), reverse=True)
@@ -422,6 +429,17 @@ def claim_store(repo, st, create=True):
         if s not in idx or not os.path.exists(s):
             continue  # taken by a nested repo's claim below
         old = idx[s].get("path")
+        nested = True  # repos nested in the moved one follow it first
+        for s2, i2 in list(idx.items()):
+            p2 = i2.get("path") or ""
+            if s2 in idx and p2.startswith(old + os.sep) and not _live(i2):
+                inner = repo / os.path.relpath(p2, old)
+                if (inner / ".git").exists():
+                    nested &= claim_store(inner, store_dir(inner),
+                                          create=False)
+        if not nested:  # keep the old parent store, so a retry finds them
+            ok = False
+            continue
         try:
             if (st / "HEAD").exists():
                 merge_store(Path(s), st)
@@ -438,12 +456,6 @@ def claim_store(repo, st, create=True):
             continue
         idx.pop(s)
         _prune_empty(Path(s).parent)
-        for s2, i2 in list(idx.items()):  # repos nested in the moved one
-            p2 = i2.get("path") or ""
-            if s2 in idx and p2.startswith(old + os.sep) and not _live(i2):
-                inner = repo / os.path.relpath(p2, old)
-                if (inner / ".git").exists():
-                    ok &= claim_store(inner, store_dir(inner), create=False)
     if not (st / "HEAD").exists():
         if not create:
             return ok
@@ -464,16 +476,16 @@ def claim_store(repo, st, create=True):
 def open_store(repo):
     """Return repo's store, creating it or taking over the one the repo had
     at a previous path (see claim_store) the first time this process opens
-    it, and move in any history still kept in the repo itself
+    it or finds another repo there, and move in any history still kept in the repo itself
     (refs/awa/record*, from older versions of awa)."""
     st = store_dir(repo)
     key = (str(stores_root()), str(st))
-    if key not in _checked or not (st / "HEAD").exists():
+    if _checked.get(key) != path_id(repo) or not (st / "HEAD").exists():
         stores_root().mkdir(parents=True, exist_ok=True)
         with open(stores_root() / ".lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)  # one claim at a time
             if claim_store(repo, st):
-                _checked.add(key)
+                _checked[key] = path_id(repo)
     for sha, ref in _recorded_refs(["-C", str(repo)]):
         _install_ref(st, repo, ref, sha, "imported")
         git("update-ref", "-d", ref, sha, cwd=repo)

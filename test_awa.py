@@ -426,13 +426,14 @@ class Moves(Base):
         self.assertEqual(sh(f"{store(moved)} rev-parse {c3}^", self.tmp), c1)
         self.assertEqual(self.ref(copy), c2)
 
-    def moved_and_replaced(self, replacement_first):
+    def moved_and_replaced(self, replacement_first, restart=True):
         c1 = awa.snapshot(self.repo)
         new = self.move(self.repo, "moved/proj")
         self.repo.mkdir()  # a new repo takes the old path
         sh("git init -q -b main && echo r > r.txt && git add -A && "
            "git commit -qm r", self.repo)
-        self.restart()
+        if restart:
+            self.restart()
         (new / "c.txt").write_text("c\n")
         for d in ([self.repo, new] if replacement_first else
                   [new, self.repo]):
@@ -448,6 +449,9 @@ class Moves(Base):
 
     def test_moved_and_replaced_old_path_seen_first(self):
         self.moved_and_replaced(True)
+
+    def test_moved_and_replaced_while_running(self):
+        self.moved_and_replaced(True, restart=False)
 
     def test_merges_into_a_store_already_at_the_new_path(self):
         c1 = awa.snapshot(self.repo)
@@ -468,24 +472,36 @@ class Moves(Base):
         self.assertFalse(old.exists())
         sh(f"git --git-dir='{st}' fsck --strict --no-dangling", self.tmp)
 
-    def test_store_from_before_ids_follows_by_reflog(self):
+    def legacy(self):
+        """Make the repo's store look like one from before awa kept ids."""
         c1 = awa.snapshot(self.repo)
         sh(f"{store(self.repo)} config --unset awa.id", self.tmp)
         (self.repo / ".git" / "awa" / "id").unlink()
         self.restart()
-        clone = self.tmp / "clone"  # shares HEAD, but its origin is present
+        return c1
+
+    def test_store_from_before_ids_follows_by_reflog(self):
+        c1 = self.legacy()
+        new = self.move(self.repo, "moved/proj")
+        (new / "c.txt").write_text("c\n")
+        c2 = awa.snapshot(new)
+        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), c1)
+        self.assertEqual(self.stores(), [awa.store_dir(new)])
+
+    def test_store_from_before_ids_shared_by_a_clone_stays(self):
+        c1 = self.legacy()
+        clone = self.tmp / "clone"  # shares HEAD; its own history is fresh
         sh(f"git clone -q '{self.repo}' '{clone}'", self.tmp)
         cc = awa.snapshot(clone)
         self.assertEqual(sh(f"{store(clone)} rev-list --count {cc}",
                             self.tmp), "1")
-        self.assertEqual(self.ref(self.repo), c1)
+        old = awa.store_dir(self.repo)
         new = self.move(self.repo, "moved/proj")
         self.restart()
-        (new / "c.txt").write_text("c\n")
-        c2 = awa.snapshot(new)
-        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), c1)
+        awa.snapshot(new)  # can't tell which of the two it was: leaves it
+        self.assertEqual(sh(f"git --git-dir='{old}' rev-parse "
+                            f"{awa.RECORD_REF}", self.tmp), c1)
         self.assertEqual(self.ref(clone), cc)
-        self.assertEqual(len(self.stores()), 2)
 
 
 class Update(Base):
