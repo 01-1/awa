@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 RECORD_REF = "refs/awa/record"
@@ -207,47 +208,278 @@ def store_dir(repo):
     return data_home() / "awa" / (rel + ".git")
 
 
-def open_store(repo):
-    """Create repo's store if needed, move in any history still kept in the
-    repo itself (refs/awa/record*, from older versions of awa), and return
-    the store's path."""
-    st = store_dir(repo)
+def stores_root():
+    return data_home() / "awa"
+
+
+def read_id(gd):
+    """The random id in <git dir>/awa/id that ties a repo to its store
+    wherever the repo moves; None if it has none."""
+    try:
+        return (Path(gd) / "awa" / "id").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def new_id(gd):
+    (Path(gd) / "awa").mkdir(exist_ok=True)
+    rid = uuid.uuid4().hex
+    _write_if_changed(Path(gd) / "awa" / "id", rid + "\n")
+    return rid
+
+
+def path_id(path):
+    """The id of the repo at path: '' if it has none, None if no repo is
+    there."""
+    if not path:
+        return None
+    dot = Path(path) / ".git"
+    if dot.is_dir():
+        return read_id(dot) or ""
+    if dot.is_file():  # a worktree or submodule: ask git where its dir is
+        r = git("rev-parse", "--absolute-git-dir", cwd=path, check=False)
+        if r.returncode == 0:
+            return read_id(r.stdout.strip()) or ""
+    return None
+
+
+INDEX_SECONDS = 60.0  # how long a scan of the stores is reused
+_index = {}    # stores root -> (time, {store: {"path", "id", ...}})
+_checked = set()  # (stores root, store) whose repo this process has checked
+
+
+def _store_info(st):
+    r = git("config", "-f", str(st / "config"), "--get-regexp", r"^awa\.",
+            cwd="/", check=False)
+    info = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition(" ")
+        info[k[len("awa."):]] = v
+    return info
+
+
+def store_index():
+    """Every store under stores_root(), with its awa.path and awa.id."""
+    root = stores_root()
+    hit = _index.get(str(root))
+    if hit and time.monotonic() - hit[0] < INDEX_SECONDS:
+        return hit[1]
+    found = {}
+    for d, subdirs, _ in os.walk(root):
+        keep = []
+        for s in subdirs:
+            p = os.path.join(d, s)
+            if s.endswith(".git") and os.path.exists(os.path.join(p, "HEAD")):
+                found[p] = _store_info(Path(p))
+            elif ".git.tmp" not in s:
+                keep.append(s)
+        subdirs[:] = keep
+    _index[str(root)] = (time.monotonic(), found)
+    return found
+
+
+def _live(info):
+    """Whether the repo a store was made for is still at its path."""
+    pid = path_id(info.get("path"))
+    return pid is not None and (not info.get("id") or pid == info["id"])
+
+
+def _last_head(st, info):
+    """The repo HEAD named by the store's newest snapshot (cached)."""
+    if "head" not in info:
+        msg = git("--git-dir", str(st), "log", "-1", "--format=%B",
+                  RECORD_REF, cwd="/", check=False).stdout
+        info["head"] = next((x[5:].strip() for x in msg.splitlines()
+                             if x.startswith("HEAD ")), "")
+    return info["head"]
+
+
+def _tip_time(st):
+    r = git("--git-dir", str(st), "log", "-1", "--format=%ct", RECORD_REF,
+            cwd="/", check=False).stdout.strip()
+    return int(r) if r.isdigit() else 0
+
+
+def _prune_empty(d):
+    root = stores_root()
+    while d != root and d.is_relative_to(root):
+        try:
+            d.rmdir()
+        except OSError:
+            return
+        d = d.parent
+
+
+def _install_ref(st, source, ref, sha, tag):
+    """Copy commit sha from the repo or store at source into store st as ref
+    (source None: st already has its objects).
+
+    If st already has ref at another commit, the new one goes in beside it
+    as ref-<tag>-<time>-<sha>. Installed only if the target is still what
+    we saw (compare-and-swap), so a concurrent snapshot is never
+    overwritten. Returns the ref used.
+    """
+    have = git("--git-dir", str(st), "rev-parse", "-q", "--verify", ref,
+               cwd="/", check=False).stdout.strip()
+    if have == sha:
+        return ref
+    dest = ref
+    if have:
+        dest = f"{ref}-{tag}-{time.strftime('%Y%m%dT%H%M%S')}-{sha[:8]}"
+    tmp = f"refs/awa/tmp/{os.getpid()}-{sha[:8]}"
+    if source is not None:  # fetch to a private ref first
+        git("--git-dir", str(st), "fetch", "-q", str(source), f"+{sha}:{tmp}",
+            cwd="/", env={"GIT_CONFIG_COUNT": "1",  # fetch the object by id
+                          "GIT_CONFIG_KEY_0": "uploadpack.allowAnySHA1InWant",
+                          "GIT_CONFIG_VALUE_0": "true"})
+    try:
+        git("--git-dir", str(st), "update-ref", dest, sha,
+            have if dest == ref else "0" * 40, cwd="/")
+    finally:
+        if source is not None:
+            git("--git-dir", str(st), "update-ref", "-d", tmp, cwd="/",
+                check=False)
+    return dest
+
+
+def _recorded_refs(git_args):
+    out = git(*git_args, "for-each-ref", "--format=%(objectname) %(refname)",
+              RECORD_REF, f"{RECORD_REF}-*", cwd="/").stdout
+    return [tuple(x.split(" ", 1)) for x in out.splitlines() if x]
+
+
+def _copy_objects(src, st):
+    """Copy the object files of store src into store st (reflinked where the
+    filesystem can), each pack's index last so git never sees half a pack."""
+    so, do = src / "objects", st / "objects"
+    files = []
+    for d, subdirs, names in os.walk(so):
+        subdirs[:] = [x for x in subdirs if x != "info"]
+        files += [Path(d) / n for n in names
+                  if not n.startswith(("tmp", "multi-pack-index"))
+                  and not n.endswith(".lock")]
+    for f in sorted(files, key=lambda f: f.suffix == ".idx"):
+        dest = do / f.relative_to(so)
+        if dest.exists():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(f"tmp-awa-{os.getpid()}-{dest.name}")
+        subprocess.run(["cp", "--reflink=auto", str(f), str(tmp)], check=True,
+                       capture_output=True)
+        os.replace(tmp, dest)
+
+
+def merge_store(src, st):
+    """Copy every recorded ref of store src into store st, never replacing
+    one, then delete src once st holds them all."""
+    refs = _recorded_refs(["--git-dir", str(src)])
+    _copy_objects(src, st)
+    kept = [(_install_ref(st, None, ref, sha, "moved"), sha)
+            for sha, ref in refs]
+    for ref, sha in kept:
+        if git("--git-dir", str(st), "rev-parse", "-q", "--verify", ref,
+               cwd="/", check=False).stdout.strip() != sha:
+            raise RuntimeError(f"{ref} did not reach {st}; kept {src}")
+    shutil.rmtree(src)
+
+
+def claim_store(repo, st, create=True):
+    """Give repo its store st, carrying over history recorded before the
+    repo was moved here.
+
+    A repo is tied to its store by the id in <git dir>/awa/id, which the
+    store keeps as awa.id. A store whose repo is gone from its path (or
+    replaced there by a repo with another id) and that has repo's id is
+    repo's own history: it is renamed to st, or merged into st if st
+    exists. Stores of repos nested in the moved one follow it. A store from
+    before awa kept ids matches when repo's HEAD reflog holds the commit
+    its last snapshot was taken at. A copy of a recorded repo (both still
+    present) gets an id of its own.
+    """
+    repo = Path(os.path.realpath(repo))
+    gd = git_dir(repo)
+    idx = store_index()
+    rid = read_id(gd)
+    if rid and any(s != str(st) and i.get("id") == rid and _live(i)
+                   for s, i in idx.items()):
+        rid = None  # a copy whose original is still recorded
+    rid = rid or new_id(gd)
+    reflog = None
+
+    def ours(s, i):
+        nonlocal reflog
+        if s == str(st) or not i.get("path"):
+            return False
+        if i.get("id"):
+            return i["id"] == rid and not _live(i)
+        if _live(i):
+            return False
+        head = _last_head(s, i)
+        if not head:
+            return False
+        if reflog is None:
+            reflog = set(git("reflog", "show", "--format=%H", "HEAD",
+                             cwd=repo, check=False).stdout.split())
+        return head in reflog
+
+    found = sorted((s for s, i in idx.items() if ours(s, i)),
+                   key=lambda s: _tip_time(s), reverse=True)
+    for s in found:
+        if s not in idx or not os.path.exists(s):
+            continue  # taken by a nested repo's claim below
+        old = idx[s].get("path")
+        try:
+            if (st / "HEAD").exists():
+                merge_store(Path(s), st)
+                print(f"awa: {repo}: merged the history recorded at {old} "
+                      f"into {st}", flush=True)
+            else:
+                st.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(s, st)
+                print(f"awa: {repo}: moved the history recorded at {old} "
+                      f"to {st}", flush=True)
+        except (RuntimeError, OSError) as e:
+            print(f"awa: {repo}: could not take over {s}: {e}", flush=True)
+            continue
+        idx.pop(s)
+        _prune_empty(Path(s).parent)
+        for s2, i2 in list(idx.items()):  # repos nested in the moved one
+            p2 = i2.get("path") or ""
+            if s2 in idx and p2.startswith(old + os.sep) and not _live(i2):
+                inner = repo / os.path.relpath(p2, old)
+                if (inner / ".git").exists():
+                    claim_store(inner, store_dir(inner), create=False)
     if not (st / "HEAD").exists():
+        if not create:
+            return
         st.parent.mkdir(parents=True, exist_ok=True)
         tmp = st.with_name(f"{st.name}.tmp{os.getpid()}")
         shutil.rmtree(tmp, ignore_errors=True)
         git("init", "-q", "--bare", str(tmp), cwd="/")
-        git("config", "awa.path", str(os.path.realpath(repo)), cwd=tmp)
-        try:
-            os.rename(tmp, st)
-        except OSError:  # another recorder made it first
-            shutil.rmtree(tmp, ignore_errors=True)
-            if not (st / "HEAD").exists():
-                raise
-    old = git("for-each-ref", "--format=%(objectname) %(refname)",
-              RECORD_REF, f"{RECORD_REF}-*", cwd=repo).stdout.split("\n")
-    for line in filter(None, old):
-        sha, ref = line.split(" ", 1)
-        have = git("--git-dir", str(st), "rev-parse", "-q", "--verify", ref,
-                   cwd="/", check=False).stdout.strip()
-        dest = ref
-        if have and have != sha:
-            dest = f"{ref}-imported-{time.strftime('%Y%m%dT%H%M%S')}-{sha[:8]}"
-        if have != sha:
-            # Fetch to a private ref, then install it only if dest is still
-            # what we saw, so a concurrent snapshot is never overwritten.
-            tmp = f"refs/awa/tmp/{os.getpid()}-{sha[:8]}"
-            git("--git-dir", str(st), "fetch", "-q", str(repo),
-                f"+{sha}:{tmp}", cwd="/",
-                env={"GIT_CONFIG_COUNT": "1",  # fetch the object by id
-                     "GIT_CONFIG_KEY_0": "uploadpack.allowAnySHA1InWant",
-                     "GIT_CONFIG_VALUE_0": "true"})
-            try:
-                git("--git-dir", str(st), "update-ref", dest, sha,
-                    have if dest == ref else "0" * 40, cwd="/")
-            finally:
-                git("--git-dir", str(st), "update-ref", "-d", tmp, cwd="/",
-                    check=False)
+        os.rename(tmp, st)
+    info = idx.setdefault(str(st), {})
+    if info.get("path") != str(repo) or info.get("id") != rid:
+        git("config", "awa.path", str(repo), cwd=st)
+        git("config", "awa.id", rid, cwd=st)
+        info.update(path=str(repo), id=rid)
+        info.pop("head", None)
+
+
+def open_store(repo):
+    """Return repo's store, creating it or taking over the one the repo had
+    at a previous path (see claim_store) the first time this process opens
+    it, and move in any history still kept in the repo itself
+    (refs/awa/record*, from older versions of awa)."""
+    st = store_dir(repo)
+    key = (str(stores_root()), str(st))
+    if key not in _checked or not (st / "HEAD").exists():
+        stores_root().mkdir(parents=True, exist_ok=True)
+        with open(stores_root() / ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # one claim at a time
+            claim_store(repo, st)
+        _checked.add(key)
+    for sha, ref in _recorded_refs(["-C", str(repo)]):
+        _install_ref(st, repo, ref, sha, "imported")
         git("update-ref", "-d", ref, sha, cwd=repo)
     return st
 
