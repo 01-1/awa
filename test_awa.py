@@ -663,8 +663,7 @@ class Backup(Base):
             real(src, dest)
             seen.append(dest)
             if len(seen) == 1:
-                st = dest / awa.store_dir(self.repo).relative_to(src)
-                self.loose(st, commit).unlink()
+                self.loose(dest, commit).unlink()
         awa.copy_tree = racy
         try:
             self.assertEqual(awa.main(["backup"]), 0)
@@ -672,6 +671,27 @@ class Backup(Base):
             awa.copy_tree = real
         self.assertEqual(len(seen), 2)
         self.assertEqual(list(self.calls()[0]["fsck"].values()), [0])
+
+    def test_copy_that_missed_a_ref_is_copied_again(self):
+        awa.snapshot(self.repo)
+        real = awa.copy_tree
+        seen = []
+
+        def racy(src, dest):  # as if pack-refs ran: the loose ref is missed
+            real(src, dest)
+            seen.append(dest)
+            (dest / "refs" / "awa" / "record.lock").write_text("")
+            if len(seen) == 1:
+                (dest / "refs" / "awa" / "record").unlink()
+        awa.copy_tree = racy
+        try:
+            self.assertEqual(awa.main(["backup"]), 0)
+        finally:
+            awa.copy_tree = real
+        self.assertEqual(len(seen), 2)
+        files = self.calls()[0]["files"]
+        self.assertTrue(any(f.endswith("/refs/awa/record") for f in files))
+        self.assertFalse(any(f.endswith(".lock") for f in files))
 
     def test_store_broken_at_the_source_fails_loudly_but_is_backed_up(self):
         commit = awa.snapshot(self.repo)
@@ -696,8 +716,9 @@ class Backup(Base):
         argv = self.calls()[0]["argv"]
         self.assertEqual(argv[:6], ["forget", "--prune", "--host", "h1",
                                     "--tag", "awa"])
-        self.assertEqual(argv[-3:], ["--max-unused", "unlimited",
-                                     "--repack-cacheable-only"])
+        self.assertEqual(argv[-5:], ["--max-unused", "unlimited",
+                                     "--repack-cacheable-only",
+                                     "--max-repack-size", "0"])
         self.assertIn("--keep-daily", argv)
 
     def test_init_only_when_missing(self):
@@ -709,10 +730,9 @@ class Backup(Base):
                          ["cat", "cat", "init"])
 
     def test_restic_passthrough(self):
-        self.assertEqual(awa.main(["backup", "--restic", "snapshots",
-                                   "--tag", "awa", "--compact"]), 0)
-        self.assertEqual(self.calls()[0]["argv"],
-                         ["snapshots", "--tag", "awa", "--compact"])
+        args = ["snapshots", "--tag", "awa", "--prune", "--help"]
+        self.assertEqual(awa.main(["backup", "--restic", *args]), 0)
+        self.assertEqual(self.calls()[0]["argv"], args)
 
     def test_needs_config(self):
         self.cfg.unlink()

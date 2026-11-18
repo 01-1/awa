@@ -1155,9 +1155,6 @@ BACKUP_KEEP = ("--keep-hourly 48 --keep-daily 30 --keep-weekly 26 "
                "--keep-monthly 24")
 BACKUP_TRIES = 5            # copies of a store that fails its check
 BACKUP_RETRY_SECONDS = 1.0  # wait before copying it again
-# Transient git files: lock files, temporary packs and objects, quarantine
-# folders of a push in progress, stores still being created.
-BACKUP_EXCLUDES = ("*.lock", "tmp_*", "incoming-*", "*.git.tmp*")
 BACKUP_UNITS = ("awa-backup.service", "awa-backup.timer",
                 "awa-backup-prune.service", "awa-backup-prune.timer")
 
@@ -1281,32 +1278,57 @@ def store_problem(st):
     return lines[0] if lines else f"git fsck exit {r.returncode}"
 
 
+def store_refs(st):
+    """The refs of the store at st with their object ids, or None if it
+    can't be read (gone)."""
+    r = git("--git-dir", str(st), "for-each-ref",
+            "--format=%(objectname) %(refname)", cwd="/", check=False)
+    return r.stdout if r.returncode == 0 else None
+
+
 def stage_stores(root, stage):
-    """Copy the store root to stage and make every copied store complete.
+    """Copy each store under root to stage, as it was at one moment.
 
     Stores change while they are copied: a snapshot writes objects, then
     moves its ref; `git gc` writes a new pack, then deletes what it
-    replaced. A copy can catch a ref without its objects, or miss a pack.
-    So each copied store is checked with `git fsck --connectivity-only`
-    and copied again until it passes. Returns [(store, problem)] for
-    stores that never passed (broken at the source, not by the copy).
+    replaced, and packs loose refs into packed-refs, then deletes them. A
+    copy can catch a ref without its objects, miss a pack, or miss a ref.
+    So a copy is kept only when its refs equal the store's just before and
+    just after copying it, and `git fsck --connectivity-only` finds every
+    object they need; otherwise the store is copied again. Leftover lock
+    files are dropped from copies. Returns [(store, problem)] for stores
+    with no such copy after BACKUP_TRIES tries; they are staged as copied.
     """
-    copy_tree(root, stage)
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True)
     bad = []
-    for st in store_dirs(stage):
-        rel = st.relative_to(stage)
+    for src in store_dirs(root):
+        rel = src.relative_to(root)
+        dest = stage / rel
         for attempt in range(1, BACKUP_TRIES + 1):
-            why = store_problem(st)
-            if not why:
+            before = store_refs(src)
+            try:
+                copy_tree(src, dest)
+            except RuntimeError:
+                if (src / "HEAD").exists():
+                    raise
+            if before is None or not (src / "HEAD").exists():
+                shutil.rmtree(dest, ignore_errors=True)  # removed meanwhile
                 break
-            if not (root / rel / "HEAD").exists():  # removed meanwhile
-                shutil.rmtree(st)
+            for f in dest.rglob("*.lock"):
+                f.unlink(missing_ok=True)
+            if store_refs(src) != before:
+                why = "its refs changed while it was copied"
+            elif store_refs(dest) != before:
+                why = "the copy's refs differ from the store's"
+            else:
+                why = store_problem(dest)
+            if not why:
                 break
             if attempt == BACKUP_TRIES:
                 bad.append((rel, why))
                 break
             time.sleep(BACKUP_RETRY_SECONDS)
-            copy_tree(root / rel, st)
     return bad
 
 
@@ -1326,14 +1348,12 @@ def backup_run():
             bad = stage_stores(root, stage)
             args = ["backup", "--tag", BACKUP_TAG, "--host", backup_host(cfg),
                     "--ignore-inode", "--skip-if-unchanged"]
-            for x in BACKUP_EXCLUDES:
-                args += ["--exclude", x]
             code = restic(cfg, *args, str(stage))
         finally:
             shutil.rmtree(stage, ignore_errors=True)
     for rel, why in bad:
-        print(f"awa: backed up {root / rel} as it is, but it is broken: "
-              f"{why}", file=sys.stderr)
+        print(f"awa: no consistent copy of {root / rel} ({why}); backed "
+              "it up as copied", file=sys.stderr)
     if code != 0:
         print(f"awa: restic backup failed (exit {code})", file=sys.stderr)
     return 1 if code or bad else 0
@@ -1341,13 +1361,14 @@ def backup_run():
 
 def backup_prune():
     """Forget old awa snapshots of this host and prune, without ever
-    downloading pack data: only packs nothing uses are deleted."""
+    downloading pack data: nothing is repacked, and only packs nothing
+    uses are deleted."""
     cfg = backup_env()
     keep = (cfg.get("AWA_BACKUP_KEEP") or BACKUP_KEEP).split()
     with backup_lock(wait=True):
         return restic(cfg, "forget", "--prune", "--host", backup_host(cfg),
                       "--tag", BACKUP_TAG, *keep, "--max-unused", "unlimited",
-                      "--repack-cacheable-only")
+                      "--repack-cacheable-only", "--max-repack-size", "0")
 
 
 def backup_init():
@@ -1477,12 +1498,12 @@ def main(argv=None):
     g.add_argument("--start", action="store_true",
                    help="back up hourly and prune weekly (systemd timers)")
     g.add_argument("--stop", action="store_true", help="stop the timers")
-    g.add_argument("--restic", action="store_true",
-                   help="run restic with the backup settings; other "
-                   "arguments go to restic")
+    g.add_argument("--restic", nargs=argparse.REMAINDER, metavar="ARGS",
+                   help="run restic with the backup settings; every "
+                   "argument after --restic goes to restic")
 
     a, extra = p.parse_known_args(argv)
-    if extra and a.cmd != "log" and not (a.cmd == "backup" and a.restic):
+    if extra and a.cmd != "log":
         p.error(f"unrecognized arguments: {' '.join(extra)}")
     if a.cmd not in ("record", "update"):
         background_update()
@@ -1513,8 +1534,8 @@ def main(argv=None):
         elif a.cmd == "store":
             print(open_store(toplevel(a.repo)))
         elif a.cmd == "backup":
-            if a.restic:
-                return restic(backup_env(), *extra)
+            if a.restic is not None:
+                return restic(backup_env(), *a.restic)
             if a.start:
                 backup_start()
             elif a.stop:
