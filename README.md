@@ -14,10 +14,11 @@ It does three things:
   snapshot holds what `git add -A` would stage at that moment, so ignored
   files stay out. A missed event costs nothing: each snapshot commits whatever
   is on disk, and there is a safety snapshot every 5 minutes.
-- **Isolates agents (opt-in, per task).** `awa new NAME` makes `<repo>@NAME`,
-  a copy-on-write reflink copy on btrfs/XFS (a full copy elsewhere), on branch
-  `awa/NAME`. It includes `node_modules` and build output, so there is nothing
-  to reinstall.
+- **Isolates agents (opt-in, per task).** `awa new NAME` makes `<repo>@NAME`
+  on branch `awa/NAME`. If the repo folder is a btrfs subvolume, the copy is
+  a snapshot of it; otherwise it is a copy-on-write reflink copy on btrfs/XFS
+  (a full copy elsewhere). It includes `node_modules` and build output, so
+  there is nothing to reinstall.
 - **Merges safely.** `awa merge NAME [--test CMD]` merges the copy's commits
   and runs the test in a temporary copy of the repo. The repo is only changed
   by a final fast-forward, which git refuses if it would overwrite local or
@@ -40,6 +41,7 @@ awa merge fix-auth --test 'pytest -x tests/test_auth.py'
 awa sync fix-auth            # merge the repo's branch into the copy
 awa list
 awa rm fix-auth              # refuses if anything there isn't on a repo branch
+awa subvol                   # make this repo folder a btrfs subvolume (once)
 ```
 
 `-C PATH` acts on another repo. Only commits are merged: an agent's
@@ -53,6 +55,34 @@ dependency and build-cache folders (`node_modules`, `.venv`, `__pycache__`,
 tools regenerate.
 It keeps the copy's edit history in the repo's store as
 `refs/awa/record-NAME-<timestamp>`, then deletes the copy's store.
+
+## Snapshots on btrfs
+
+On btrfs, make the repo folder a subvolume with `awa subvol`; `awa new` then
+copies it with `btrfs subvolume snapshot`. A snapshot shares the
+filesystem's metadata with its source: it takes constant time, and only the
+files that change afterwards cost anything. A reflink copy instead creates a
+new inode and extent reference for every file, which for a repo with a large
+`node_modules` (hundreds of thousands of files) bloats btrfs metadata and
+slows every filesystem commit. Subvolumes nested in another subvolume are
+also left out of snapshots of the outer one (such as snapper's snapshots of
+`/home`), so agents' edits don't pile up there. Merges (`awa merge`) make
+their temporary copy the same way.
+
+`awa subvol` creates a subvolume beside the folder, copies the folder into
+it with reflinks, checks that every path, type, mode, size, modification
+time and link target matches, swaps the two names, and deletes the old
+folder. It refuses on other filesystems, and while any process has its
+current folder, open files or inotify watches inside the repo (shown with
+their process ids), including an `awa record` recorder: stop it, convert,
+and start it again. Files that were hard links to files outside the repo
+(pnpm's store, for example) become reflink copies.
+
+`awa rm` deletes a snapshot copy with `btrfs subvolume delete`. Without root,
+that needs the `user_subvol_rm_allowed` mount option; without it, awa
+deletes the files one by one and then the empty subvolume, which anyone who
+owns it may do. A snapshot holds only the repo's own subvolume: subvolumes
+nested inside the repo appear in the copy as empty folders.
 
 ## Where history is stored
 
@@ -179,7 +209,8 @@ with `touch ~/.config/awa/no-auto-update` (or `AWA_NO_AUTO_UPDATE=1`);
 `awa update` updates now either way.
 
 Python 3.9+, git 2.38+, Linux, systemd (only for `record --start` and
-`backup --start`), restic (only for `backup`). No packages.
+`backup --start`), restic (only for `backup`), btrfs-progs (only for
+subvolume snapshots). No packages.
 Tests: `python3 test_awa.py` (uses `~/.cache/awa-test`, or `AWA_TEST_DIR`).
 
 ## Limits
