@@ -323,6 +323,187 @@ class Tree(Base):
         self.assertFalse(t.is_alive())
 
 
+    def test_follows_a_repo_moved_while_recording(self):
+        quiet, again = awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS
+        awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS = 0.3, 0.5
+        stop = threading.Event()
+        t = threading.Thread(target=awa.record_tree, args=(self.tmp,),
+                             kwargs={"stop": stop}, daemon=True)
+        t.start()
+        try:
+            self.assertTrue(wait_for(lambda: self.ref(self.repo)))
+            first, old = self.ref(self.repo), awa.store_dir(self.repo)
+            new = self.tmp / "group" / "proj"
+            new.parent.mkdir()
+            os.rename(self.repo, new)
+            self.assertTrue(wait_for(lambda: self.ref(new)))
+            edits = iter(range(10 ** 6))  # until its watcher is up
+
+            def edited():
+                (new / "m.txt").write_text(f"{next(edits)}\n")
+                time.sleep(0.4)
+                return self.ref(new) != first
+            self.assertTrue(wait_for(edited, 8.0))
+            sh(f"{store(new)} merge-base --is-ancestor {first} "
+               f"{self.ref(new)}", self.tmp)
+            self.assertFalse(old.exists())
+        finally:
+            stop.set()
+            t.join(15)
+            awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS = quiet, again
+        self.assertFalse(t.is_alive())
+
+
+class Moves(Base):
+    def ref(self, d, ref=awa.RECORD_REF):
+        return subprocess.run(["git", "--git-dir", str(awa.store_dir(d)),
+                               "rev-parse", "-q", "--verify", ref],
+                              capture_output=True, text=True).stdout.strip()
+
+    def stores(self):
+        return [s for s in awa.stores_root().rglob("*.git")
+                if (s / "HEAD").exists()]
+
+    def restart(self):
+        """Forget what this process knows, as a newly started awa would."""
+        awa._index.clear()
+        awa._checked.clear()
+
+    def move(self, src, rel):
+        dest = self.tmp / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(src, dest)
+        return dest
+
+    def test_moved_repo_keeps_its_history(self):
+        (self.repo / "b.txt").write_text("b\n")
+        c1 = awa.snapshot(self.repo)
+        old = awa.store_dir(self.repo)
+        new = self.move(self.repo, "elsewhere/proj2")
+        (new / "c.txt").write_text("c\n")
+        c2 = awa.snapshot(new)
+        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), c1)
+        self.assertFalse(old.exists())
+        self.assertEqual(self.stores(), [awa.store_dir(new)])
+
+    def test_moved_while_awa_was_not_running(self):
+        c1 = awa.snapshot(self.repo)
+        new = self.move(self.repo, "later/proj")
+        self.restart()
+        (new / "c.txt").write_text("c\n")
+        c2 = awa.snapshot(new)
+        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), c1)
+        self.assertEqual(self.stores(), [awa.store_dir(new)])
+
+    def test_nested_repo_follows_its_parent(self):
+        inner = self.repo / "sub" / "inner"
+        inner.mkdir(parents=True)
+        sh("git init -q -b main && echo i > i.txt && git add -A && "
+           "git commit -qm i", inner)
+        awa.snapshot(self.repo)
+        ci = awa.snapshot(inner)
+        new = self.move(self.repo, "moved/proj")
+        awa.snapshot(new)  # only the parent is recorded again
+        self.assertEqual(self.ref(new / "sub" / "inner"), ci)
+        self.assertFalse(awa.store_dir(inner).exists())
+        self.assertFalse(awa.store_dir(self.repo).with_suffix("").exists())
+        self.assertEqual(len(self.stores()), 2)
+
+    def test_copy_gets_its_own_store(self):
+        c1 = awa.snapshot(self.repo)
+        copy = self.tmp / "copy"
+        sh(f"cp -a '{self.repo}' '{copy}'", self.tmp)
+        (copy / "x.txt").write_text("x\n")
+        c2 = awa.snapshot(copy)
+        self.assertEqual(self.ref(self.repo), c1)
+        self.assertEqual(sh(f"{store(copy)} rev-list --count {c2}", self.tmp),
+                         "1")
+        self.assertNotEqual(awa.read_id(copy / ".git"),
+                            awa.read_id(self.repo / ".git"))
+        moved = self.move(self.repo, "moved/proj")
+        (moved / "m.txt").write_text("m\n")
+        c3 = awa.snapshot(moved)
+        self.assertEqual(sh(f"{store(moved)} rev-parse {c3}^", self.tmp), c1)
+        self.assertEqual(self.ref(copy), c2)
+
+    def moved_and_replaced(self, replacement_first, restart=True):
+        c1 = awa.snapshot(self.repo)
+        new = self.move(self.repo, "moved/proj")
+        self.repo.mkdir()  # a new repo takes the old path
+        sh("git init -q -b main && echo r > r.txt && git add -A && "
+           "git commit -qm r", self.repo)
+        if restart:
+            self.restart()
+        (new / "c.txt").write_text("c\n")
+        for d in ([self.repo, new] if replacement_first else
+                  [new, self.repo]):
+            awa.snapshot(d)
+        sh(f"{store(new)} merge-base --is-ancestor {c1} {awa.RECORD_REF}",
+           self.tmp)
+        self.assertEqual(sh(f"{store(self.repo)} rev-list --count "
+                            f"{awa.RECORD_REF}", self.tmp), "1")
+        self.assertEqual(len(self.stores()), 2)
+
+    def test_moved_and_replaced_new_path_seen_first(self):
+        self.moved_and_replaced(False)
+
+    def test_moved_and_replaced_old_path_seen_first(self):
+        self.moved_and_replaced(True)
+
+    def test_moved_and_replaced_while_running(self):
+        self.moved_and_replaced(True, restart=False)
+
+    def test_merges_into_a_store_already_at_the_new_path(self):
+        c1 = awa.snapshot(self.repo)
+        old = awa.store_dir(self.repo)
+        sh(f"git --git-dir='{old}' gc -q", self.tmp)  # packed objects too
+        new = self.move(self.repo, "new/proj")
+        # An older awa already began a fresh history at the new path.
+        st = awa.store_dir(new)
+        sh(f"git init -q --bare '{st}' && git --git-dir='{st}' fetch -q "
+           f"'{new}' HEAD:{awa.RECORD_REF}", self.tmp)
+        fresh = self.ref(new)
+        (new / "c.txt").write_text("c\n")
+        c2 = awa.snapshot(new)
+        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), fresh)
+        kept = sh(f"{store(new)} for-each-ref --format='%(objectname)' "
+                  f"'{awa.RECORD_REF}-moved-*'", self.tmp)
+        self.assertEqual(kept, c1)
+        self.assertFalse(old.exists())
+        sh(f"git --git-dir='{st}' fsck --strict --no-dangling", self.tmp)
+
+    def legacy(self):
+        """Make the repo's store look like one from before awa kept ids."""
+        c1 = awa.snapshot(self.repo)
+        sh(f"{store(self.repo)} config --unset awa.id", self.tmp)
+        (self.repo / ".git" / "awa" / "id").unlink()
+        self.restart()
+        return c1
+
+    def test_store_from_before_ids_follows_by_reflog(self):
+        c1 = self.legacy()
+        new = self.move(self.repo, "moved/proj")
+        (new / "c.txt").write_text("c\n")
+        c2 = awa.snapshot(new)
+        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), c1)
+        self.assertEqual(self.stores(), [awa.store_dir(new)])
+
+    def test_store_from_before_ids_shared_by_a_clone_stays(self):
+        c1 = self.legacy()
+        clone = self.tmp / "clone"  # shares HEAD; its own history is fresh
+        sh(f"git clone -q '{self.repo}' '{clone}'", self.tmp)
+        cc = awa.snapshot(clone)
+        self.assertEqual(sh(f"{store(clone)} rev-list --count {cc}",
+                            self.tmp), "1")
+        old = awa.store_dir(self.repo)
+        new = self.move(self.repo, "moved/proj")
+        self.restart()
+        awa.snapshot(new)  # can't tell which of the two it was: leaves it
+        self.assertEqual(sh(f"git --git-dir='{old}' rev-parse "
+                            f"{awa.RECORD_REF}", self.tmp), c1)
+        self.assertEqual(self.ref(clone), cc)
+
+
 class Update(Base):
     def setUp(self):
         super().setUp()

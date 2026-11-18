@@ -63,8 +63,22 @@ outside `$HOME` go under `@abs/`. The store holds every object its history
 needs, so it survives the repo being deleted or recloned. Inspect it with
 `awa log`, or `git --git-dir "$(awa store)" show <commit>:<file>`.
 History that older versions kept in the repo itself (`refs/awa/record*`) is
-moved into the store on the next snapshot. A moved or renamed repo starts a
-new store at its new path; the old one stays where it was.
+moved into the store on the next snapshot.
+
+A moved or renamed repo keeps its history. awa writes a random id to
+`.git/awa/id` and keeps it in the store as `awa.id`. When a repo shows up at
+a new path, awa looks for a store whose repo is gone from its old path and
+has the same id, and renames it to the new path (or, if a store is already
+there, copies its refs in beside the existing ones as
+`refs/awa/record-moved-<time>-<commit>` and deletes it). Stores of repos
+nested inside the moved one follow it. This works whether the move happened
+while awa was running or not. Stores made before awa kept ids match when the
+repo's HEAD reflog, and no other recorded repo's, holds the commit their last
+snapshot was taken at. A copy
+of a recorded repo, with the original still present, gets an id and a store
+of its own. If a new repo takes a moved repo's old path first, the old store
+is renamed aside (`<name>@awa-moved-<id>-<time>.git`) until the moved repo
+claims it.
 
 ## Recording many repos
 
