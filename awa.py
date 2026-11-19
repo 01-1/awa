@@ -6,11 +6,15 @@ Workspaces for running several coding agents on one git repo:
           refs/awa/record of a bare repo in ~/.local/share/awa/, without
           touching the folder's branch, index, HEAD, refs or objects.
           With --tree, one process records every repo under a folder.
-  new     Make an isolated copy of a repo (btrfs reflink, instant) on its own
-          branch awa/<name>, at <repo>@<name>.
+  new     Make an isolated copy of a repo (a btrfs snapshot if the repo is a
+          subvolume, else a reflink copy) on its own branch awa/<name>, at
+          <repo>@<name>.
+  subvol  Turn a repo folder into a btrfs subvolume in place.
   merge   Merge a copy's branch and run a test in a temporary copy, then
           fast-forward the repo; bring the copy up to date.
   log     Show a repo's recorded history (git log arguments pass through).
+  backup  Back up every history store with restic, from a checked copy;
+          --prune forgets old backups without downloading pack data.
 
 Standard library only. Linux only (inotify via ctypes).
 """
@@ -22,12 +26,15 @@ import fcntl
 import hashlib
 import os
 import select
+import shlex
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 RECORD_REF = "refs/awa/record"
@@ -203,47 +210,278 @@ def store_dir(repo):
     return data_home() / "awa" / (rel + ".git")
 
 
-def open_store(repo):
-    """Create repo's store if needed, move in any history still kept in the
-    repo itself (refs/awa/record*, from older versions of awa), and return
-    the store's path."""
-    st = store_dir(repo)
+def stores_root():
+    return data_home() / "awa"
+
+
+def read_id(gd):
+    """The random id in <git dir>/awa/id that ties a repo to its store
+    wherever the repo moves; None if it has none."""
+    try:
+        return (Path(gd) / "awa" / "id").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def new_id(gd):
+    (Path(gd) / "awa").mkdir(exist_ok=True)
+    rid = uuid.uuid4().hex
+    _write_if_changed(Path(gd) / "awa" / "id", rid + "\n")
+    return rid
+
+
+def path_id(path):
+    """The id of the repo at path: '' if it has none, None if no repo is
+    there."""
+    if not path:
+        return None
+    dot = Path(path) / ".git"
+    if dot.is_dir():
+        return read_id(dot) or ""
+    if dot.is_file():  # a worktree or submodule: ask git where its dir is
+        r = git("rev-parse", "--absolute-git-dir", cwd=path, check=False)
+        if r.returncode == 0:
+            return read_id(r.stdout.strip()) or ""
+    return None
+
+
+INDEX_SECONDS = 60.0  # how long a scan of the stores is reused
+_index = {}    # stores root -> (time, {store: {"path", "id", ...}})
+_checked = {}  # (stores root, store) -> id of the repo this process checked
+
+
+def _store_info(st):
+    r = git("config", "-f", str(st / "config"), "--get-regexp", r"^awa\.",
+            cwd="/", check=False)
+    info = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition(" ")
+        info[k[len("awa."):]] = v
+    return info
+
+
+def store_index():
+    """Every store under stores_root(), with its awa.path and awa.id."""
+    root = stores_root()
+    hit = _index.get(str(root))
+    if hit and time.monotonic() - hit[0] < INDEX_SECONDS:
+        return hit[1]
+    found = {str(p): _store_info(p) for p in store_dirs(root)}
+    _index[str(root)] = (time.monotonic(), found)
+    return found
+
+
+def _live(info):
+    """Whether the repo a store was made for is still at its path."""
+    pid = path_id(info.get("path"))
+    return pid is not None and (not info.get("id") or pid == info["id"])
+
+
+def _last_head(st, info):
+    """The repo HEAD named by the store's newest snapshot (cached)."""
+    if "head" not in info:
+        msg = git("--git-dir", str(st), "log", "-1", "--format=%B",
+                  RECORD_REF, cwd="/", check=False).stdout
+        info["head"] = next((x[5:].strip() for x in msg.splitlines()
+                             if x.startswith("HEAD ")), "")
+    return info["head"]
+
+
+def _tip_time(st):
+    r = git("--git-dir", str(st), "log", "-1", "--format=%ct", RECORD_REF,
+            cwd="/", check=False).stdout.strip()
+    return int(r) if r.isdigit() else 0
+
+
+def _prune_empty(d):
+    root = stores_root()
+    while d != root and d.is_relative_to(root):
+        try:
+            d.rmdir()
+        except OSError:
+            return
+        d = d.parent
+
+
+def _install_ref(st, source, ref, sha, tag):
+    """Copy commit sha from the repo or store at source into store st as ref.
+
+    If st already has ref at another commit, the new one goes in beside it
+    as ref-<tag>-<time>-<sha>. Fetched to a private ref first, then
+    installed only if the target is still what we saw (compare-and-swap),
+    so a concurrent snapshot is never overwritten. Returns the ref used.
+    """
+    have = git("--git-dir", str(st), "rev-parse", "-q", "--verify", ref,
+               cwd="/", check=False).stdout.strip()
+    if have == sha:
+        return ref
+    dest = ref
+    if have:
+        dest = f"{ref}-{tag}-{time.strftime('%Y%m%dT%H%M%S')}-{sha[:8]}"
+    tmp = f"refs/awa/tmp/{os.getpid()}-{sha[:8]}"
+    git("--git-dir", str(st), "fetch", "-q", str(source), f"+{sha}:{tmp}",
+        cwd="/", env={"GIT_CONFIG_COUNT": "1",  # fetch the object by id
+                      "GIT_CONFIG_KEY_0": "uploadpack.allowAnySHA1InWant",
+                      "GIT_CONFIG_VALUE_0": "true"})
+    try:
+        git("--git-dir", str(st), "update-ref", dest, sha,
+            have if dest == ref else "0" * 40, cwd="/")
+    finally:
+        git("--git-dir", str(st), "update-ref", "-d", tmp, cwd="/",
+            check=False)
+    return dest
+
+
+def _recorded_refs(git_args):
+    out = git(*git_args, "for-each-ref", "--format=%(objectname) %(refname)",
+              RECORD_REF, f"{RECORD_REF}-*", cwd="/").stdout
+    return [tuple(x.split(" ", 1)) for x in out.splitlines() if x]
+
+
+def merge_store(src, st):
+    """Copy every recorded ref of store src into store st, never replacing
+    one, then delete src once st holds them all."""
+    refs = _recorded_refs(["--git-dir", str(src)])
+    kept = [(_install_ref(st, src, ref, sha, "moved"), sha)
+            for sha, ref in refs]
+    for ref, sha in kept:
+        if git("--git-dir", str(st), "rev-parse", "-q", "--verify", ref,
+               cwd="/", check=False).stdout.strip() != sha:
+            raise RuntimeError(f"{ref} did not reach {st}; kept {src}")
+    shutil.rmtree(src)
+
+
+def claim_store(repo, st, create=True):
+    """Give repo its store st, carrying over history recorded before the
+    repo was moved here.
+
+    A repo is tied to its store by the id in <git dir>/awa/id, which the
+    store keeps as awa.id. A store whose repo is gone from its path (or
+    replaced there by a repo with another id) and that has repo's id is
+    repo's own history: it is renamed to st, or merged into st if st
+    exists. A store at st that has another repo's id (that repo was moved
+    away and this one took its place) is first renamed aside, for that repo
+    to claim. Stores of repos nested in the moved one follow it. A store from
+    before awa kept ids matches when repo's HEAD reflog, and no other
+    recorded repo's, holds the commit its last snapshot was taken at. A copy
+    of a recorded repo (both still present) gets an id of its own. Returns
+    the repo's id, or None if a store it should take over was left behind,
+    so that a later call tries again.
+    """
+    repo = Path(os.path.realpath(repo))
+    gd = git_dir(repo)
+    idx = store_index()
+    rid = read_id(gd)
+    if rid and any(s != str(st) and i.get("id") == rid and _live(i)
+                   for s, i in idx.items()):
+        rid = None  # a copy whose original is still recorded
+    rid = rid or new_id(gd)
+    ok = True
+    if (st / "HEAD").exists():
+        here = _store_info(st)
+        if here.get("id") and here["id"] != rid:
+            aside = st.with_name(f"{st.name[:-4]}@awa-moved-{here['id'][:8]}"
+                                 f"-{time.strftime('%Y%m%dT%H%M%S')}.git")
+            try:
+                os.rename(st, aside)
+            except OSError as e:  # never write into another repo's history
+                raise RuntimeError(f"could not set aside {st}: {e}") from e
+            idx.pop(str(st), None)
+            idx[str(aside)] = here
+            print(f"awa: {repo}: {st} holds the history of another repo "
+                  f"once at this path; kept it as {aside}", flush=True)
+    reflogs = {}
+
+    def in_reflog(path, head):
+        if path not in reflogs:
+            reflogs[path] = set(git("reflog", "show", "--format=%H", "HEAD",
+                                    cwd=path, check=False).stdout.split())
+        return head in reflogs[path]
+
+    def ours(s, i):
+        if s == str(st) or not i.get("path"):
+            return False
+        if i.get("id"):
+            return i["id"] == rid and not _live(i)
+        if _live(i):
+            return False
+        head = _last_head(s, i)
+        if not head or not in_reflog(repo, head):
+            return False
+        others = [i2["path"] for i2 in list(idx.values()) if i2.get("path")
+                  and i2["path"] != str(repo) and _live(i2)]
+        if any(in_reflog(o, head) for o in others):
+            print(f"awa: {repo}: not taking over {s}: other repos share its "
+                  "last HEAD", flush=True)
+            return False
+        return True
+
+    found = sorted((s for s, i in idx.items() if ours(s, i)),
+                   key=lambda s: _tip_time(s), reverse=True)
+    for s in found:
+        if s not in idx or not os.path.exists(s):
+            continue  # taken by a nested repo's claim
+        old = idx[s].get("path")
+        nested = True  # repos nested in the moved one follow it first
+        for s2, i2 in list(idx.items()):
+            p2 = i2.get("path") or ""
+            if s2 in idx and p2.startswith(old + os.sep) and not _live(i2):
+                inner = repo / os.path.relpath(p2, old)
+                if (inner / ".git").exists():
+                    nested &= bool(claim_store(inner, store_dir(inner),
+                                               create=False))
+        if not nested:  # keep the old parent store, so a retry finds them
+            ok = False
+            continue
+        try:
+            if (st / "HEAD").exists():
+                merge_store(Path(s), st)
+                print(f"awa: {repo}: merged the history recorded at {old} "
+                      f"into {st}", flush=True)
+            else:
+                st.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(s, st)
+                print(f"awa: {repo}: moved the history recorded at {old} "
+                      f"to {st}", flush=True)
+        except (RuntimeError, OSError) as e:
+            print(f"awa: {repo}: could not take over {s}: {e}", flush=True)
+            ok = False
+            continue
+        idx.pop(s)
+        _prune_empty(Path(s).parent)
     if not (st / "HEAD").exists():
+        if not create:
+            return rid if ok else None
         st.parent.mkdir(parents=True, exist_ok=True)
         tmp = st.with_name(f"{st.name}.tmp{os.getpid()}")
         shutil.rmtree(tmp, ignore_errors=True)
         git("init", "-q", "--bare", str(tmp), cwd="/")
-        git("config", "awa.path", str(os.path.realpath(repo)), cwd=tmp)
-        try:
-            os.rename(tmp, st)
-        except OSError:  # another recorder made it first
-            shutil.rmtree(tmp, ignore_errors=True)
-            if not (st / "HEAD").exists():
-                raise
-    old = git("for-each-ref", "--format=%(objectname) %(refname)",
-              RECORD_REF, f"{RECORD_REF}-*", cwd=repo).stdout.split("\n")
-    for line in filter(None, old):
-        sha, ref = line.split(" ", 1)
-        have = git("--git-dir", str(st), "rev-parse", "-q", "--verify", ref,
-                   cwd="/", check=False).stdout.strip()
-        dest = ref
-        if have and have != sha:
-            dest = f"{ref}-imported-{time.strftime('%Y%m%dT%H%M%S')}-{sha[:8]}"
-        if have != sha:
-            # Fetch to a private ref, then install it only if dest is still
-            # what we saw, so a concurrent snapshot is never overwritten.
-            tmp = f"refs/awa/tmp/{os.getpid()}-{sha[:8]}"
-            git("--git-dir", str(st), "fetch", "-q", str(repo),
-                f"+{sha}:{tmp}", cwd="/",
-                env={"GIT_CONFIG_COUNT": "1",  # fetch the object by id
-                     "GIT_CONFIG_KEY_0": "uploadpack.allowAnySHA1InWant",
-                     "GIT_CONFIG_VALUE_0": "true"})
-            try:
-                git("--git-dir", str(st), "update-ref", dest, sha,
-                    have if dest == ref else "0" * 40, cwd="/")
-            finally:
-                git("--git-dir", str(st), "update-ref", "-d", tmp, cwd="/",
-                    check=False)
+        os.rename(tmp, st)
+    info = idx.setdefault(str(st), {})
+    if info.get("path") != str(repo) or info.get("id") != rid:
+        git("config", "awa.path", str(repo), cwd=st)
+        git("config", "awa.id", rid, cwd=st)
+        info.update(path=str(repo), id=rid)
+        info.pop("head", None)
+    return rid if ok else None
+
+
+def open_store(repo):
+    """Return repo's store, creating it or taking over the one the repo had
+    at a previous path (see claim_store) the first time this process opens
+    it or finds another repo there, and move in any history still kept in the repo itself
+    (refs/awa/record*, from older versions of awa)."""
+    st = store_dir(repo)
+    key = (str(stores_root()), str(st))
+    if _checked.get(key) != path_id(repo) or not (st / "HEAD").exists():
+        stores_root().mkdir(parents=True, exist_ok=True)
+        with open(stores_root() / ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # one claim at a time
+            rid = claim_store(repo, st)
+            if rid:
+                _checked[key] = rid
+    for sha, ref in _recorded_refs(["-C", str(repo)]):
+        _install_ref(st, repo, ref, sha, "imported")
         git("update-ref", "-d", ref, sha, cwd=repo)
     return st
 
@@ -742,6 +980,56 @@ def reflink_copy(src, dest):
         subprocess.run(["cp", "-a", str(src), str(dest)], check=True)
 
 
+def fs_type(path):
+    r = subprocess.run(["stat", "-f", "-c", "%T", str(path)],
+                       capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def is_subvol(path):
+    """True if path is the root of a btrfs subvolume (always inode 256)."""
+    try:
+        if os.lstat(path).st_ino != 256:
+            return False
+    except OSError:
+        return False
+    return fs_type(path) == "btrfs"
+
+
+def make_copy(src, dest):
+    """Copy src to dest: a btrfs snapshot if src is a subvolume, else a
+    reflink copy (a full copy where reflinks aren't supported)."""
+    if is_subvol(src):
+        r = subprocess.run(["btrfs", "subvolume", "snapshot", str(src),
+                            str(dest)], capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        print(f"awa: btrfs snapshot failed ({r.stderr.strip()}); "
+              "falling back to a reflink copy", file=sys.stderr)
+    reflink_copy(src, dest)
+
+
+def remove_tree(path):
+    """Delete a folder or btrfs subvolume. Raises RuntimeError naming what
+    is left if it can't delete it all."""
+    if is_subvol(path):
+        r = subprocess.run(["btrfs", "subvolume", "delete", str(path)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return
+        # Without the user_subvol_rm_allowed mount option only root may
+        # delete a subvolume, but anyone may rmdir an empty one they own.
+        print(f"awa: btrfs subvolume delete of {path} failed (mount with "
+              "user_subvol_rm_allowed to allow it); deleting its files one "
+              "by one", file=sys.stderr)
+    try:
+        shutil.rmtree(path)
+    except OSError as e:
+        left = "it is still there" if os.path.lexists(path) else "nothing"
+        raise RuntimeError(f"deleting {path} failed ({e}); {left} "
+                           "is left") from e
+
+
 def ws_new(repo, name, record):
     repo = toplevel(repo)
     check_name(name)
@@ -754,7 +1042,7 @@ def ws_new(repo, name, record):
     if dirty(repo, untracked=False):
         print("awa: note: the repo has uncommitted changes; the copy gets "
               "them too", file=sys.stderr)
-    reflink_copy(repo, dest)
+    make_copy(repo, dest)
     # The copy must not share the repo's recorder state or refs.
     shutil.rmtree(git_dir(dest) / "awa", ignore_errors=True)
     for ref in git("for-each-ref", "--format=%(refname)", "refs/awa/",
@@ -851,7 +1139,7 @@ def try_merge(repo, dest, name, test):
               "one crashed. Delete it if no merge is running.")
         return 1
     try:
-        reflink_copy(repo, cand)
+        make_copy(repo, cand)
         git("reset", "-q", "--hard", "HEAD", cwd=cand)
         r = git("merge", "--no-ff", "--no-edit", "-q", "--no-overwrite-ignore",
                 "-m", f"Merge workspace {name}", incoming, cwd=cand,
@@ -889,7 +1177,10 @@ def try_merge(repo, dest, name, test):
         print(f"awa: merged {branch} into {repo.name} ({merged[:10]})")
         return 0
     finally:
-        shutil.rmtree(cand, ignore_errors=True)
+        try:
+            remove_tree(cand)
+        except RuntimeError as e:
+            print(f"awa: {e}", file=sys.stderr)
 
 
 def ws_merge(repo, name, test):
@@ -967,10 +1258,179 @@ def ws_rm(repo, name, force):
         git("--git-dir", str(st), "fetch", "-q", str(src),
             *[f"{r}:{kept}{r[len(RECORD_REF):]}" for r in refs], cwd="/")
         print(f"awa: kept its edit history as {kept} in {st}")
-    shutil.rmtree(dest)
+    remove_tree(dest)
     shutil.rmtree(src, ignore_errors=True)
     git("update-ref", "-d", f"refs/awa/incoming/{name}", cwd=repo, check=False)
     print(f"awa: removed {dest}")
+
+
+def tree_listing(root):
+    """Every entry below root with its type, mode, size, mtime and link
+    target, sorted; and the inode numbers of everything in it."""
+    out, inodes = [], {os.lstat(root).st_ino}
+    for d, subdirs, files in os.walk(root):
+        for n in subdirs + files:
+            path = os.path.join(d, n)
+            st = os.lstat(path)
+            inodes.add(st.st_ino)
+            rel = os.path.relpath(path, root)
+            if os.path.isdir(path) and not os.path.islink(path):
+                out.append((rel, "d", st.st_mode, 0, 0, ""))
+            else:
+                link = os.readlink(path) if os.path.islink(path) else ""
+                out.append((rel, "f", st.st_mode, st.st_size,
+                            st.st_mtime_ns, link))
+    return sorted(out), inodes
+
+
+def watch_key(root):
+    """How inotify fdinfo names the filesystem of root: the superblock's
+    device (st_dev differs on btrfs) and, on btrfs, the subvolume id."""
+    r = subprocess.run(["findmnt", "-no", "MAJ:MIN", "-T", str(root)],
+                       capture_output=True, text=True)
+    major, minor = (int(x) for x in r.stdout.split()[0].split(":"))
+    r = subprocess.run(["btrfs", "inspect-internal", "rootid", str(root)],
+                       capture_output=True, text=True)
+    return (major << 20) | minor, int(r.stdout) if r.returncode == 0 else None
+
+
+def watches_inside(line, inodes, key):
+    """Whether an inotify fdinfo line watches one of the inodes."""
+    kv = dict(x.split(":", 1) for x in line.split()[1:] if ":" in x)
+    try:
+        if (int(kv["ino"], 16) not in inodes
+                or int(kv["sdev"], 16) != key[0]):
+            return False
+        # A btrfs file handle starts with the inode's objectid and its
+        # subvolume's id, little-endian; inode numbers repeat across
+        # subvolumes.
+        if key[1] is not None and kv.get("fhandle-type") in ("4d", "4e",
+                                                              "4f"):
+            h = bytes.fromhex(kv["f_handle"])
+            return int.from_bytes(h[8:16], "little") == key[1]
+    except (KeyError, ValueError):
+        return False
+    return True
+
+
+def holders(root, inodes):
+    """Processes using anything inside root: their cwd, root folder, open
+    files, or inotify watches."""
+    root = os.path.realpath(root)
+    key = watch_key(root)
+    inside = (lambda t: t == root or t.startswith(root + "/"))
+    found = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        why = set()
+        try:
+            for link in ("cwd", "root"):
+                if inside(os.readlink(f"/proc/{pid}/{link}")):
+                    why.add(link)
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    target = os.readlink(f"/proc/{pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if inside(target):
+                    why.add("open files")
+                elif target == "anon_inode:inotify":
+                    try:
+                        with open(f"/proc/{pid}/fdinfo/{fd}") as f:
+                            if any(line.startswith("inotify ") and
+                                   watches_inside(line, inodes, key)
+                                   for line in f):
+                                why.add("inotify watches")
+                    except OSError:
+                        continue  # closed meanwhile
+        except OSError:
+            pass  # gone, or another user's
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                comm = f.read().strip()
+        except OSError:
+            comm = "?"
+        if why:
+            found.append(f"{pid} ({comm}): {', '.join(sorted(why))}")
+    return found
+
+
+def ws_subvol(path):
+    """Turn a repo folder into a btrfs subvolume in place, so `awa new`
+    snapshots it."""
+    given = Path(os.path.abspath(path))
+    given_old = given.parent / f".{given.name}@awa-old"
+    if not os.path.lexists(given) and os.path.lexists(given_old):
+        die(f"{given} is missing, and {given_old} holds it from a conversion "
+            f"that stopped: move it back to {given}")
+    repo = toplevel(path)
+    if fs_type(repo) != "btrfs":
+        die(f"{repo} is not on btrfs")
+    os.chdir(repo.parent)  # don't hold the folder ourselves
+    new = repo.parent / f".{repo.name}@awa-subvol"
+    old = repo.parent / f".{repo.name}@awa-old"
+    if is_subvol(repo):
+        if os.path.lexists(old):
+            print(f"awa: {old} is probably the old folder from a conversion "
+                  "whose cleanup was cut short; delete it if you don't need "
+                  "it", file=sys.stderr)
+        print(f"awa: {repo} is already a btrfs subvolume")
+        return
+    if os.path.lexists(old):
+        die(f"{old} exists: it holds the folder from a conversion that "
+            f"stopped after moving it. If {repo} is missing anything, it is "
+            "there; move it back or delete it, then run this again.")
+    if os.path.lexists(new):
+        die(f"{new} exists: another conversion is running, or one stopped "
+            "before swapping (the folder is intact). Delete it if none is "
+            "running.")
+    listing, inodes = tree_listing(repo)
+    busy = holders(repo, inodes)
+    if busy:
+        die(f"not converting {repo}: processes are using it:\n"
+            + "\n".join(busy) + "\nStop them or move them out of it (a "
+            "shell: cd out; a recorder: awa record --stop, or --tree --stop "
+            "on its folder), then run this again.")
+    r = subprocess.run(["btrfs", "subvolume", "create", str(new)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"btrfs subvolume create failed: {r.stderr.strip()}")
+    try:
+        r = subprocess.run(["cp", "-a", "--reflink=always", f"{repo}/.",
+                            f"{new}/"], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"copying failed: {r.stderr.strip()}")
+        if tree_listing(new)[0] != listing or tree_listing(repo)[0] != listing:
+            raise RuntimeError("the copy differs from the folder (did "
+                               "something write to it meanwhile?)")
+        busy = holders(repo, inodes)
+        if busy:
+            raise RuntimeError("processes started using it:\n"
+                               + "\n".join(busy))
+        st = os.lstat(repo)
+        os.chmod(new, st.st_mode & 0o7777)
+        os.utime(new, ns=(st.st_atime_ns, st.st_mtime_ns))
+        os.rename(repo, old)
+        try:
+            os.rename(new, repo)
+        except OSError:
+            os.rename(old, repo)
+            raise
+    except (RuntimeError, OSError) as e:
+        try:
+            remove_tree(new)
+        except RuntimeError as e2:
+            print(f"awa: {e2}", file=sys.stderr)
+        die(f"not converting {repo}: {e}; it is unchanged")
+    try:
+        shutil.rmtree(old)
+    except OSError as e:
+        print(f"awa: {repo} is now a btrfs subvolume, but deleting the old "
+              f"folder {old} failed ({e}); delete it by hand",
+              file=sys.stderr)
+        return
+    print(f"awa: {repo} is now a btrfs subvolume; awa new snapshots it")
 
 
 def ws_list(repo):
@@ -1143,6 +1603,300 @@ def background_update():
         pass
 
 
+# ---------------------------------------------------------------- backup
+
+BACKUP_TAG = "awa"
+# restic forget policy; AWA_BACKUP_KEEP in backup.env replaces it
+BACKUP_KEEP = ("--keep-hourly 48 --keep-daily 30 --keep-weekly 26 "
+               "--keep-monthly 24")
+BACKUP_TRIES = 5            # copies of a store that fails its check
+BACKUP_RETRY_SECONDS = 1.0  # wait before copying it again
+BACKUP_UNITS = ("awa-backup.service", "awa-backup.timer",
+                "awa-backup-prune.service", "awa-backup-prune.timer")
+
+
+def state_home():
+    return Path(os.environ.get("XDG_STATE_HOME")
+                or Path.home() / ".local" / "state")
+
+
+def backup_config():
+    return config_home() / "awa" / "backup.env"
+
+
+def backup_stage():
+    """Where `awa backup` puts the checked copy restic reads. Fixed, so
+    restic finds its parent snapshot and only reads changed files."""
+    return state_home() / "awa" / "backup-stage"
+
+
+def read_env_file(path):
+    """KEY=VALUE lines (an `export ` prefix, quotes and # comments allowed)
+    as a dict. Values may be secrets: never print them."""
+    out = {}
+    for n, line in enumerate(Path(path).read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if not sep or not key.isidentifier():
+            raise RuntimeError(f"{path}:{n}: expected KEY=VALUE")
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+
+def backup_env():
+    """Variables for restic: ~/.config/awa/backup.env, plus the provider
+    credentials file it names in AWA_BACKUP_ENV_FILE (backup.env wins)."""
+    path = backup_config()
+    if not path.exists():
+        raise RuntimeError(f"no backup config; create {path} "
+                           "(see the README, Backups)")
+    cfg = read_env_file(path)
+    for k in ("RESTIC_PASSWORD_FILE", "AWA_BACKUP_ENV_FILE",
+              "AWA_BACKUP_RESTIC"):
+        if cfg.get(k):
+            cfg[k] = os.path.expanduser(cfg[k])
+    if cfg.get("AWA_BACKUP_ENV_FILE"):
+        cfg = {**read_env_file(cfg["AWA_BACKUP_ENV_FILE"]), **cfg}
+    if not cfg.get("RESTIC_REPOSITORY"):
+        raise RuntimeError(f"{path}: RESTIC_REPOSITORY is not set")
+    if not any(cfg.get(k) for k in ("RESTIC_PASSWORD_FILE", "RESTIC_PASSWORD",
+                                    "RESTIC_PASSWORD_COMMAND")):
+        raise RuntimeError(f"{path}: RESTIC_PASSWORD_FILE is not set")
+    return cfg
+
+
+def backup_host(cfg):
+    return cfg.get("AWA_BACKUP_HOST") or socket.gethostname()
+
+
+def restic(cfg, *args, quiet=False):
+    """Run restic with cfg in its environment (secrets never go on the
+    command line). Returns its exit code."""
+    exe = cfg.get("AWA_BACKUP_RESTIC") or "restic"
+    out = subprocess.DEVNULL if quiet else None
+    try:
+        return subprocess.run([exe, *args], env={**os.environ, **cfg},
+                              stdout=out, stderr=out).returncode
+    except FileNotFoundError:
+        raise RuntimeError(f"{exe} not found; install restic")
+
+
+def backup_lock(wait):
+    """The lock that keeps backups and prunes from overlapping, or None if
+    it is taken and wait is False."""
+    p = state_home() / "awa" / "backup.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    f = open(p, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
+def copy_tree(src, dest):
+    """Replace dest with a copy of src (reflinks where the filesystem has
+    them). Files that vanish mid-copy are fine: the copy is checked."""
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["cp", "-a", "--reflink=auto", "--", str(src),
+                        str(dest)], capture_output=True, text=True)
+    if not dest.exists():
+        raise RuntimeError(f"copying {src} failed: {r.stderr.strip()}")
+
+
+def store_dirs(root):
+    """The history stores (bare repos named *.git) under root."""
+    found = []
+    for d, subdirs, files in os.walk(root):
+        if d.endswith(".git") and "HEAD" in files and "objects" in subdirs:
+            found.append(Path(d))
+            subdirs[:] = []
+    return sorted(found)
+
+
+def store_problem(st):
+    """Why the store at st is broken ('' if it isn't): any ref or reflog
+    entry naming an object it doesn't have."""
+    r = git("--git-dir", str(st), "fsck", "--connectivity-only",
+            "--no-dangling", "--no-progress", cwd="/", check=False)
+    if r.returncode == 0:
+        return ""
+    lines = (r.stderr or r.stdout).strip().splitlines()
+    return lines[0] if lines else f"git fsck exit {r.returncode}"
+
+
+def store_refs(st):
+    """The refs of the store at st with their object ids, or None if it
+    can't be read (gone)."""
+    r = git("--git-dir", str(st), "for-each-ref",
+            "--format=%(objectname) %(refname)", cwd="/", check=False)
+    return r.stdout if r.returncode == 0 else None
+
+
+def stage_stores(root, stage):
+    """Copy each store under root to stage, as it was at one moment.
+
+    Stores change while they are copied: a snapshot writes objects, then
+    moves its ref; `git gc` writes a new pack, then deletes what it
+    replaced, and packs loose refs into packed-refs, then deletes them. A
+    copy can catch a ref without its objects, miss a pack, or miss a ref.
+    So a copy is kept only when its refs equal the store's just before and
+    just after copying it, and `git fsck --connectivity-only` finds every
+    object they need; otherwise the store is copied again. Leftover lock
+    files are dropped from copies. Returns [(store, problem)] for stores
+    with no such copy after BACKUP_TRIES tries; they are staged as copied.
+    """
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True)
+    bad = []
+    for src in store_dirs(root):
+        rel = src.relative_to(root)
+        dest = stage / rel
+        for attempt in range(1, BACKUP_TRIES + 1):
+            before = store_refs(src)
+            try:
+                copy_tree(src, dest)
+            except RuntimeError:
+                if (src / "HEAD").exists():
+                    raise
+            if not (src / "HEAD").exists():
+                shutil.rmtree(dest, ignore_errors=True)  # removed meanwhile
+                break
+            for f in dest.rglob("*.lock"):
+                f.unlink(missing_ok=True)
+            if before is None:
+                why = "git can't read its refs"
+            elif store_refs(src) != before:
+                why = "its refs changed while it was copied"
+            elif store_refs(dest) != before:
+                why = "the copy's refs differ from the store's"
+            else:
+                why = store_problem(dest)
+            if not why:
+                break
+            if attempt == BACKUP_TRIES:
+                bad.append((rel, why))
+                break
+            time.sleep(BACKUP_RETRY_SECONDS)
+    return bad
+
+
+def backup_run():
+    """Back up every history store with restic, from a checked copy."""
+    cfg = backup_env()
+    root = data_home() / "awa"
+    if not root.is_dir():
+        raise RuntimeError(f"no history stores in {root}")
+    lock = backup_lock(wait=False)
+    if lock is None:
+        print("awa: another awa backup or prune is running; skipping")
+        return 0
+    with lock:
+        stage = backup_stage()
+        try:
+            bad = stage_stores(root, stage)
+            args = ["backup", "--tag", BACKUP_TAG, "--host", backup_host(cfg),
+                    "--ignore-inode", "--skip-if-unchanged"]
+            code = restic(cfg, *args, str(stage))
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    for rel, why in bad:
+        print(f"awa: no consistent copy of {root / rel} ({why}); backed "
+              "it up as copied", file=sys.stderr)
+    if code != 0:
+        print(f"awa: restic backup failed (exit {code})", file=sys.stderr)
+    return 1 if code or bad else 0
+
+
+def backup_prune():
+    """Forget old awa snapshots of this host and prune, without ever
+    downloading pack data: nothing is repacked, and only packs nothing
+    uses are deleted."""
+    cfg = backup_env()
+    keep = (cfg.get("AWA_BACKUP_KEEP") or BACKUP_KEEP).split()
+    with backup_lock(wait=True):
+        return restic(cfg, "forget", "--prune", "--host", backup_host(cfg),
+                      "--tag", BACKUP_TAG, *keep, "--max-unused", "unlimited",
+                      "--repack-cacheable-only", "--max-repack-size", "0")
+
+
+def backup_init():
+    """Create the restic repository unless it exists."""
+    cfg = backup_env()
+    code = restic(cfg, "cat", "config", quiet=True)
+    if code == 0:
+        print(f"awa: {cfg['RESTIC_REPOSITORY']} already exists")
+        return 0
+    if code != 10:  # 10: the repository does not exist
+        raise RuntimeError(f"can't tell whether {cfg['RESTIC_REPOSITORY']} "
+                           f"exists (restic exit {code})")
+    return restic(cfg, "init")
+
+
+def backup_unit_files():
+    """{file name: text} of the backup units: hourly backup, weekly prune."""
+    cmd = shlex.join([sys.executable, os.path.abspath(__file__), "backup"])
+    path = os.environ.get("PATH") or "/usr/bin:/bin"
+
+    def service(desc, arg, timeout):
+        return (f"[Unit]\nDescription=awa: {desc}\n\n[Service]\n"
+                f"Type=oneshot\nEnvironment=\"PATH={path}\"\n"
+                f"ExecStart={cmd}{arg}\nNice=10\nIOSchedulingClass=idle\n"
+                f"TimeoutStartSec={timeout}\n")
+
+    def timer(desc, when, delay):
+        return (f"[Unit]\nDescription=awa: {desc}\n\n[Timer]\n"
+                f"OnCalendar={when}\nRandomizedDelaySec={delay}\n"
+                "Persistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    return dict(zip(BACKUP_UNITS, (
+        service("back up the history stores with restic", "", "6h"),
+        timer("hourly backup of the history stores", "hourly", "5min"),
+        service("forget old backups and prune (no pack downloads)",
+                " --prune", "2h"),
+        timer("weekly prune of the history store backups", "weekly", "1h"))))
+
+
+def systemctl(*args):
+    r = subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                       text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"systemctl --user {' '.join(args)} failed: "
+                           f"{r.stderr.strip()}")
+
+
+def backup_start():
+    backup_env()  # refuse to schedule backups that can't run
+    d = config_home() / "systemd" / "user"
+    d.mkdir(parents=True, exist_ok=True)
+    for name, text in backup_unit_files().items():
+        _write_if_changed(d / name, text)
+    systemctl("daemon-reload")
+    systemctl("enable", "--now", *[u for u in BACKUP_UNITS
+                                   if u.endswith(".timer")])
+    print("awa: backups scheduled: hourly (awa-backup.timer), prune weekly "
+          "(awa-backup-prune.timer); logs: journalctl --user -u awa-backup")
+
+
+def backup_stop():
+    timers = [u for u in BACKUP_UNITS if u.endswith(".timer")]
+    subprocess.run(["systemctl", "--user", "disable", "--now", *timers],
+                   capture_output=True)
+    d = config_home() / "systemd" / "user"
+    for name in BACKUP_UNITS:
+        (d / name).unlink(missing_ok=True)
+    systemctl("daemon-reload")
+    print("awa: backups unscheduled (a backup already running finishes)")
+
+
 # ---------------------------------------------------------------- cli
 
 def main(argv=None):
@@ -1178,6 +1932,9 @@ def main(argv=None):
 
     sub.add_parser("list", help="list copies")
 
+    sub.add_parser("subvol", help="turn the repo folder into a btrfs "
+                   "subvolume in place, so awa new snapshots it")
+
     sub.add_parser("log", help="git log refs/awa/record in the repo's store; "
                    "other arguments go to git log")
 
@@ -1191,10 +1948,33 @@ def main(argv=None):
     u.add_argument("--quiet", action="store_true")
     u.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
 
+    b = sub.add_parser("backup", allow_abbrev=False,
+                       help="back up every history store with restic "
+                       "(settings: ~/.config/awa/backup.env)")
+    g = b.add_mutually_exclusive_group()
+    g.add_argument("--prune", action="store_true",
+                   help="forget old backups and prune, downloading no packs")
+    g.add_argument("--init", action="store_true",
+                   help="create the restic repository")
+    g.add_argument("--start", action="store_true",
+                   help="back up hourly and prune weekly (systemd timers)")
+    g.add_argument("--stop", action="store_true", help="stop the timers")
+    g.add_argument("--restic", action="store_true",
+                   help="run restic with the backup settings; every "
+                   "argument after --restic goes to restic")
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    restic_args = []
+    i = 0  # the subcommand: the first word that isn't an option or -C's value
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] == "-C" else 1
+    if argv[i:i + 1] == ["backup"] and "--restic" in argv[i:]:
+        i = argv.index("--restic", i) + 1
+        argv, restic_args = argv[:i], argv[i:]  # verbatim, even -- and -h
     a, extra = p.parse_known_args(argv)
     if extra and a.cmd != "log":
         p.error(f"unrecognized arguments: {' '.join(extra)}")
-    if a.cmd not in ("record", "update"):
+    if a.cmd not in ("record", "update", "subvol"):
         background_update()
     try:
         if a.cmd == "update":
@@ -1218,10 +1998,25 @@ def main(argv=None):
             return 0 if ws_sync(repo, dest) else 1
         elif a.cmd == "list":
             ws_list(a.repo)
+        elif a.cmd == "subvol":
+            ws_subvol(a.repo)
         elif a.cmd == "rm":
             ws_rm(a.repo, a.name, a.force)
         elif a.cmd == "store":
             print(open_store(toplevel(a.repo)))
+        elif a.cmd == "backup":
+            if a.restic:
+                return restic(backup_env(), *restic_args)
+            if a.start:
+                backup_start()
+            elif a.stop:
+                backup_stop()
+            elif a.init:
+                return backup_init()
+            elif a.prune:
+                return backup_prune()
+            else:
+                return backup_run()
         elif a.cmd == "log":
             st = open_store(toplevel(a.repo))
             return subprocess.run(["git", "--git-dir", str(st), "log",

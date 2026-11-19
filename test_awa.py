@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for awa. Run: python3 test_awa.py (one file, one process)."""
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -323,6 +324,187 @@ class Tree(Base):
         self.assertFalse(t.is_alive())
 
 
+    def test_follows_a_repo_moved_while_recording(self):
+        quiet, again = awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS
+        awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS = 0.3, 0.5
+        stop = threading.Event()
+        t = threading.Thread(target=awa.record_tree, args=(self.tmp,),
+                             kwargs={"stop": stop}, daemon=True)
+        t.start()
+        try:
+            self.assertTrue(wait_for(lambda: self.ref(self.repo)))
+            first, old = self.ref(self.repo), awa.store_dir(self.repo)
+            new = self.tmp / "group" / "proj"
+            new.parent.mkdir()
+            os.rename(self.repo, new)
+            self.assertTrue(wait_for(lambda: self.ref(new)))
+            edits = iter(range(10 ** 6))  # until its watcher is up
+
+            def edited():
+                (new / "m.txt").write_text(f"{next(edits)}\n")
+                time.sleep(0.4)
+                return self.ref(new) != first
+            self.assertTrue(wait_for(edited, 8.0))
+            sh(f"{store(new)} merge-base --is-ancestor {first} "
+               f"{self.ref(new)}", self.tmp)
+            self.assertFalse(old.exists())
+        finally:
+            stop.set()
+            t.join(15)
+            awa.QUIET_SECONDS, awa.REDISCOVER_SECONDS = quiet, again
+        self.assertFalse(t.is_alive())
+
+
+class Moves(Base):
+    def ref(self, d, ref=awa.RECORD_REF):
+        return subprocess.run(["git", "--git-dir", str(awa.store_dir(d)),
+                               "rev-parse", "-q", "--verify", ref],
+                              capture_output=True, text=True).stdout.strip()
+
+    def stores(self):
+        return [s for s in awa.stores_root().rglob("*.git")
+                if (s / "HEAD").exists()]
+
+    def restart(self):
+        """Forget what this process knows, as a newly started awa would."""
+        awa._index.clear()
+        awa._checked.clear()
+
+    def move(self, src, rel):
+        dest = self.tmp / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(src, dest)
+        return dest
+
+    def test_moved_repo_keeps_its_history(self):
+        (self.repo / "b.txt").write_text("b\n")
+        c1 = awa.snapshot(self.repo)
+        old = awa.store_dir(self.repo)
+        new = self.move(self.repo, "elsewhere/proj2")
+        (new / "c.txt").write_text("c\n")
+        c2 = awa.snapshot(new)
+        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), c1)
+        self.assertFalse(old.exists())
+        self.assertEqual(self.stores(), [awa.store_dir(new)])
+
+    def test_moved_while_awa_was_not_running(self):
+        c1 = awa.snapshot(self.repo)
+        new = self.move(self.repo, "later/proj")
+        self.restart()
+        (new / "c.txt").write_text("c\n")
+        c2 = awa.snapshot(new)
+        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), c1)
+        self.assertEqual(self.stores(), [awa.store_dir(new)])
+
+    def test_nested_repo_follows_its_parent(self):
+        inner = self.repo / "sub" / "inner"
+        inner.mkdir(parents=True)
+        sh("git init -q -b main && echo i > i.txt && git add -A && "
+           "git commit -qm i", inner)
+        awa.snapshot(self.repo)
+        ci = awa.snapshot(inner)
+        new = self.move(self.repo, "moved/proj")
+        awa.snapshot(new)  # only the parent is recorded again
+        self.assertEqual(self.ref(new / "sub" / "inner"), ci)
+        self.assertFalse(awa.store_dir(inner).exists())
+        self.assertFalse(awa.store_dir(self.repo).with_suffix("").exists())
+        self.assertEqual(len(self.stores()), 2)
+
+    def test_copy_gets_its_own_store(self):
+        c1 = awa.snapshot(self.repo)
+        copy = self.tmp / "copy"
+        sh(f"cp -a '{self.repo}' '{copy}'", self.tmp)
+        (copy / "x.txt").write_text("x\n")
+        c2 = awa.snapshot(copy)
+        self.assertEqual(self.ref(self.repo), c1)
+        self.assertEqual(sh(f"{store(copy)} rev-list --count {c2}", self.tmp),
+                         "1")
+        self.assertNotEqual(awa.read_id(copy / ".git"),
+                            awa.read_id(self.repo / ".git"))
+        moved = self.move(self.repo, "moved/proj")
+        (moved / "m.txt").write_text("m\n")
+        c3 = awa.snapshot(moved)
+        self.assertEqual(sh(f"{store(moved)} rev-parse {c3}^", self.tmp), c1)
+        self.assertEqual(self.ref(copy), c2)
+
+    def moved_and_replaced(self, replacement_first, restart=True):
+        c1 = awa.snapshot(self.repo)
+        new = self.move(self.repo, "moved/proj")
+        self.repo.mkdir()  # a new repo takes the old path
+        sh("git init -q -b main && echo r > r.txt && git add -A && "
+           "git commit -qm r", self.repo)
+        if restart:
+            self.restart()
+        (new / "c.txt").write_text("c\n")
+        for d in ([self.repo, new] if replacement_first else
+                  [new, self.repo]):
+            awa.snapshot(d)
+        sh(f"{store(new)} merge-base --is-ancestor {c1} {awa.RECORD_REF}",
+           self.tmp)
+        self.assertEqual(sh(f"{store(self.repo)} rev-list --count "
+                            f"{awa.RECORD_REF}", self.tmp), "1")
+        self.assertEqual(len(self.stores()), 2)
+
+    def test_moved_and_replaced_new_path_seen_first(self):
+        self.moved_and_replaced(False)
+
+    def test_moved_and_replaced_old_path_seen_first(self):
+        self.moved_and_replaced(True)
+
+    def test_moved_and_replaced_while_running(self):
+        self.moved_and_replaced(True, restart=False)
+
+    def test_merges_into_a_store_already_at_the_new_path(self):
+        c1 = awa.snapshot(self.repo)
+        old = awa.store_dir(self.repo)
+        sh(f"git --git-dir='{old}' gc -q", self.tmp)  # packed objects too
+        new = self.move(self.repo, "new/proj")
+        # An older awa already began a fresh history at the new path.
+        st = awa.store_dir(new)
+        sh(f"git init -q --bare '{st}' && git --git-dir='{st}' fetch -q "
+           f"'{new}' HEAD:{awa.RECORD_REF}", self.tmp)
+        fresh = self.ref(new)
+        (new / "c.txt").write_text("c\n")
+        c2 = awa.snapshot(new)
+        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), fresh)
+        kept = sh(f"{store(new)} for-each-ref --format='%(objectname)' "
+                  f"'{awa.RECORD_REF}-moved-*'", self.tmp)
+        self.assertEqual(kept, c1)
+        self.assertFalse(old.exists())
+        sh(f"git --git-dir='{st}' fsck --strict --no-dangling", self.tmp)
+
+    def legacy(self):
+        """Make the repo's store look like one from before awa kept ids."""
+        c1 = awa.snapshot(self.repo)
+        sh(f"{store(self.repo)} config --unset awa.id", self.tmp)
+        (self.repo / ".git" / "awa" / "id").unlink()
+        self.restart()
+        return c1
+
+    def test_store_from_before_ids_follows_by_reflog(self):
+        c1 = self.legacy()
+        new = self.move(self.repo, "moved/proj")
+        (new / "c.txt").write_text("c\n")
+        c2 = awa.snapshot(new)
+        self.assertEqual(sh(f"{store(new)} rev-parse {c2}^", self.tmp), c1)
+        self.assertEqual(self.stores(), [awa.store_dir(new)])
+
+    def test_store_from_before_ids_shared_by_a_clone_stays(self):
+        c1 = self.legacy()
+        clone = self.tmp / "clone"  # shares HEAD; its own history is fresh
+        sh(f"git clone -q '{self.repo}' '{clone}'", self.tmp)
+        cc = awa.snapshot(clone)
+        self.assertEqual(sh(f"{store(clone)} rev-list --count {cc}",
+                            self.tmp), "1")
+        old = awa.store_dir(self.repo)
+        new = self.move(self.repo, "moved/proj")
+        self.restart()
+        awa.snapshot(new)  # can't tell which of the two it was: leaves it
+        self.assertEqual(sh(f"git --git-dir='{old}' rev-parse "
+                            f"{awa.RECORD_REF}", self.tmp), c1)
+        self.assertEqual(self.ref(clone), cc)
+
+
 class Update(Base):
     def setUp(self):
         super().setUp()
@@ -559,6 +741,359 @@ class Workspaces(Base):
         (self.tmp / ".proj@w1.merging").mkdir()
         self.assertEqual(self.awa("merge", "w1"), 1)
         self.assertTrue((w1 / "m.txt").exists())
+
+
+ON_BTRFS = (BASE.mkdir(parents=True, exist_ok=True) or
+            awa.fs_type(BASE) == "btrfs") and bool(shutil.which("btrfs"))
+
+FAILING_BTRFS_DELETE = """#!/bin/sh
+[ "$1 $2" = "subvolume delete" ] && { echo "Operation not permitted" >&2; exit 1; }
+exec %s "$@"
+"""
+
+
+@unittest.skipUnless(ON_BTRFS, "needs btrfs and btrfs-progs")
+class Subvolumes(Base):
+    def setUp(self):
+        super().setUp()
+        self.cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        super().tearDown()
+
+    def test_subvol_then_new_snapshots_merge_rm(self):
+        (self.repo / "node_modules").mkdir()
+        (self.repo / "node_modules" / "x.js").write_text("x")
+        os.symlink("a.txt", self.repo / "link")
+        sh("git add link && git commit -qm link", self.repo)
+        head = self.head()
+        self.assertFalse(awa.is_subvol(self.repo))
+        self.assertEqual(self.awa("subvol"), 0)
+        self.assertTrue(awa.is_subvol(self.repo))
+        self.assertEqual(self.head(), head)
+        self.assertEqual(sh("git status --porcelain", self.repo), "")
+        self.assertEqual(os.readlink(self.repo / "link"), "a.txt")
+        self.assertEqual((self.repo / "node_modules" / "x.js").read_text(), "x")
+        self.assertEqual(list(self.tmp.glob(".proj@*")), [])  # no leftovers
+        self.assertEqual(self.awa("subvol"), 0)  # already one: no-op
+        (self.tmp / ".proj@awa-old").mkdir()  # an interrupted cleanup
+        self.assertEqual(self.awa("subvol"), 0)
+        self.assertTrue((self.tmp / ".proj@awa-old").exists())  # kept
+        (self.tmp / ".proj@awa-old").rmdir()
+        w = self.ws("w")
+        self.assertTrue(awa.is_subvol(w))
+        self.assertEqual(sh("git branch --show-current", w), "awa/w")
+        self.assertTrue((w / "node_modules" / "x.js").exists())
+        sh("echo b > b.txt && git add -A && git commit -qm b", w)
+        self.assertEqual(self.awa("merge", "w"), 0)
+        self.assertTrue((self.repo / "b.txt").exists())
+        self.assertEqual(self.awa("rm", "w"), 0)
+        self.assertFalse(os.path.lexists(w))
+        self.assertFalse(list(self.tmp.glob(".proj@*")))  # merge copy gone
+
+    def test_rm_deletes_files_when_subvolume_delete_is_refused(self):
+        self.assertEqual(self.awa("subvol"), 0)
+        w = self.ws("w")
+        bin_ = self.tmp / "bin"
+        bin_.mkdir()
+        (bin_ / "btrfs").write_text(FAILING_BTRFS_DELETE
+                                    % shutil.which("btrfs"))
+        (bin_ / "btrfs").chmod(0o755)
+        path = os.environ["PATH"]
+        os.environ["PATH"] = f"{bin_}:{path}"
+        try:
+            self.assertEqual(self.awa("rm", "w"), 0)
+        finally:
+            os.environ["PATH"] = path
+        self.assertFalse(os.path.lexists(w))
+
+    def test_new_on_plain_folder_is_a_reflink_copy(self):
+        w = self.ws("w")
+        self.assertFalse(awa.is_subvol(w))
+        self.assertEqual(sh("git branch --show-current", w), "awa/w")
+
+    def assert_refused(self):
+        with self.assertRaises(SystemExit):
+            self.awa("subvol")
+        self.assertFalse(awa.is_subvol(self.repo))
+        self.assertEqual(list(self.tmp.glob(".proj@*")), [])
+
+    def test_subvol_names_the_old_folder_if_the_repo_is_missing(self):
+        old = self.tmp / ".proj@awa-old"
+        self.repo.rename(old)
+        with self.assertRaises(SystemExit):
+            self.awa("subvol")
+        self.assertTrue((old / ".git").exists())
+
+    def holder(self, code):
+        """A child process that runs code, prints ready and waits."""
+        p = subprocess.Popen(
+            [sys.executable, "-c", f"import sys; sys.path.insert(0, "
+             f"{str(Path(__file__).parent)!r}); import awa\n{code}\n"
+             "print('ready', flush=True); sys.stdin.read()"],
+            cwd=self.tmp, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True)
+        self.assertEqual(p.stdout.readline().strip(), "ready")
+        return p
+
+    def check_refused_while(self, code):
+        p = self.holder(code)
+        try:
+            self.assert_refused()
+        finally:
+            p.stdin.close()
+            p.wait()
+            p.stdout.close()
+        self.assertEqual(self.awa("subvol"), 0)  # fine once it is gone
+
+    def test_subvol_refuses_open_files(self):
+        self.check_refused_while(f"f = open({str(self.repo / 'a.txt')!r})")
+
+    def test_subvol_refuses_a_process_inside(self):
+        self.check_refused_while(f"import os; os.chdir({str(self.repo)!r})")
+
+    def test_subvol_refuses_inotify_watches(self):
+        self.check_refused_while(f"w = awa.Watcher({str(self.repo)!r})")
+
+    def test_subvol_refuses_inotify_watch_on_a_file(self):
+        self.check_refused_while(
+            "import ctypes, os; libc = ctypes.CDLL(None, use_errno=True); "
+            "fd = libc.inotify_init1(0); "
+            f"assert libc.inotify_add_watch(fd, {str(self.repo / 'a.txt')!r}"
+            ".encode(), 2) >= 0")
+
+
+class SubvolElsewhere(Base):
+    @unittest.skipUnless(os.path.isdir("/dev/shm")
+                         and awa.fs_type("/dev/shm") not in ("btrfs", ""),
+                         "needs a non-btrfs /dev/shm")
+    def test_subvol_refuses_other_filesystems(self):
+        d = Path(tempfile.mkdtemp(dir="/dev/shm"))
+        try:
+            sh("git init -q", d)
+            with self.assertRaises(SystemExit):
+                awa.main(["-C", str(d), "subvol"])
+        finally:
+            shutil.rmtree(d)
+
+
+FAKE_RESTIC = r"""#!/usr/bin/env python3
+import json, os, subprocess, sys
+rec = {"argv": sys.argv[1:],
+       "env": {k: os.environ.get(k) for k in (
+           "RESTIC_REPOSITORY", "RESTIC_PASSWORD_FILE", "B2_ACCOUNT_ID",
+           "B2_ACCOUNT_KEY")}}
+if sys.argv[1:2] == ["backup"]:
+    top = sys.argv[-1]
+    rec["files"] = sorted(os.path.relpath(os.path.join(d, f), top)
+                          for d, _, fs in os.walk(top) for f in fs)
+    rec["fsck"] = {
+        os.path.relpath(d, top): subprocess.run(
+            ["git", "--git-dir", d, "fsck", "--connectivity-only"],
+            capture_output=True).returncode
+        for d, _, fs in os.walk(top) if d.endswith(".git") and "HEAD" in fs}
+with open(os.environ["FAKE_RESTIC_LOG"], "a") as f:
+    f.write(json.dumps(rec) + "\n")
+if sys.argv[1:3] == ["cat", "config"]:
+    sys.exit(int(os.environ.get("FAKE_RESTIC_CAT", "0")))
+sys.exit(int(os.environ.get("FAKE_RESTIC_EXIT", "0")))
+"""
+
+FAKE_SYSTEMCTL = """#!/bin/sh
+echo "$@" >> "$FAKE_SYSTEMCTL_LOG"
+"""
+
+
+class Backup(Base):
+    def setUp(self):
+        super().setUp()
+        self.saved = {k: os.environ.get(k) for k in (
+            "PATH", "XDG_STATE_HOME", "FAKE_RESTIC_LOG", "FAKE_RESTIC_CAT",
+            "FAKE_RESTIC_EXIT", "FAKE_SYSTEMCTL_LOG")}
+        os.environ["XDG_STATE_HOME"] = str(self.tmp / "state")
+        self.log = self.tmp / "restic.log"
+        os.environ["FAKE_RESTIC_LOG"] = str(self.log)
+        bin_ = self.tmp / "bin"
+        bin_.mkdir()
+        for name, text in (("restic", FAKE_RESTIC),
+                           ("systemctl", FAKE_SYSTEMCTL)):
+            (bin_ / name).write_text(text)
+            (bin_ / name).chmod(0o755)
+        os.environ["PATH"] = f"{bin_}:{os.environ['PATH']}"
+        creds = self.tmp / "b2.env"
+        creds.write_text("export B2_ACCOUNT_ID=id123\nB2_ACCOUNT_KEY='s3cret'\n")
+        cfg = Path(os.environ["XDG_CONFIG_HOME"]) / "awa" / "backup.env"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(f"# test\nRESTIC_REPOSITORY=b2:bucket:awa\n"
+                       f"RESTIC_PASSWORD_FILE={self.tmp}/pw\n"
+                       f"AWA_BACKUP_ENV_FILE={creds}\nAWA_BACKUP_HOST=h1\n")
+        self.cfg = cfg
+        self.retry = awa.BACKUP_RETRY_SECONDS
+        awa.BACKUP_RETRY_SECONDS = 0
+
+    def tearDown(self):
+        awa.BACKUP_RETRY_SECONDS = self.retry
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def calls(self):
+        import json
+        if not self.log.exists():
+            return []
+        return [json.loads(x) for x in self.log.read_text().splitlines()]
+
+    def loose(self, st, commit):
+        return st / "objects" / commit[:2] / commit[2:]
+
+    def test_backs_up_a_checked_copy_with_tag_host_and_env(self):
+        awa.snapshot(self.repo)
+        self.assertEqual(awa.main(["backup"]), 0)
+        (c,) = self.calls()
+        argv = c["argv"]
+        self.assertEqual(argv[0], "backup")
+        for a, b in (("--tag", "awa"), ("--host", "h1")):
+            self.assertEqual(argv[argv.index(a) + 1], b)
+        self.assertIn("--ignore-inode", argv)
+        self.assertEqual(argv[-1], str(awa.backup_stage()))
+        self.assertNotIn("s3cret", " ".join(argv))
+        self.assertEqual(c["env"], {
+            "RESTIC_REPOSITORY": "b2:bucket:awa",
+            "RESTIC_PASSWORD_FILE": f"{self.tmp}/pw",
+            "B2_ACCOUNT_ID": "id123", "B2_ACCOUNT_KEY": "s3cret"})
+        rel = str(awa.store_dir(self.repo).relative_to(
+            awa.data_home() / "awa"))
+        self.assertIn(f"{rel}/HEAD", c["files"])
+        self.assertEqual(c["fsck"], {rel: 0})
+        self.assertFalse(awa.backup_stage().exists())
+
+    def test_copy_caught_mid_write_is_copied_again(self):
+        commit = awa.snapshot(self.repo)
+        real = awa.copy_tree
+        seen = []
+
+        def racy(src, dest):  # the first copy gets the ref, not the commit
+            real(src, dest)
+            seen.append(dest)
+            if len(seen) == 1:
+                self.loose(dest, commit).unlink()
+        awa.copy_tree = racy
+        try:
+            self.assertEqual(awa.main(["backup"]), 0)
+        finally:
+            awa.copy_tree = real
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(list(self.calls()[0]["fsck"].values()), [0])
+
+    def test_copy_that_missed_a_ref_is_copied_again(self):
+        awa.snapshot(self.repo)
+        real = awa.copy_tree
+        seen = []
+
+        def racy(src, dest):  # as if pack-refs ran: the loose ref is missed
+            real(src, dest)
+            seen.append(dest)
+            (dest / "refs" / "awa" / "record.lock").write_text("")
+            if len(seen) == 1:
+                (dest / "refs" / "awa" / "record").unlink()
+        awa.copy_tree = racy
+        try:
+            self.assertEqual(awa.main(["backup"]), 0)
+        finally:
+            awa.copy_tree = real
+        self.assertEqual(len(seen), 2)
+        files = self.calls()[0]["files"]
+        self.assertTrue(any(f.endswith("/refs/awa/record") for f in files))
+        self.assertFalse(any(f.endswith(".lock") for f in files))
+
+    def test_store_broken_at_the_source_fails_loudly_but_is_backed_up(self):
+        commit = awa.snapshot(self.repo)
+        self.loose(awa.store_dir(self.repo), commit).unlink()
+        self.assertEqual(awa.main(["backup"]), 1)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_store_whose_refs_cant_be_read_is_kept_and_reported(self):
+        awa.snapshot(self.repo)
+        with open(awa.store_dir(self.repo) / "config", "a") as f:
+            f.write("[broken\n")
+        self.assertEqual(awa.main(["backup"]), 1)
+        rel = str(awa.store_dir(self.repo).relative_to(
+            awa.data_home() / "awa"))
+        self.assertIn(f"{rel}/HEAD", self.calls()[0]["files"])
+
+    def test_restic_failure_fails(self):
+        awa.snapshot(self.repo)
+        os.environ["FAKE_RESTIC_EXIT"] = "1"
+        self.assertEqual(awa.main(["backup"]), 1)
+        self.assertFalse(awa.backup_stage().exists())
+
+    def test_skips_while_a_backup_or_prune_runs(self):
+        awa.snapshot(self.repo)
+        with awa.backup_lock(wait=False):
+            self.assertEqual(awa.main(["backup"]), 0)
+        self.assertEqual(self.calls(), [])
+
+    def test_prune_is_scoped_and_never_repacks(self):
+        self.assertEqual(awa.main(["backup", "--prune"]), 0)
+        argv = self.calls()[0]["argv"]
+        self.assertEqual(argv[:6], ["forget", "--prune", "--host", "h1",
+                                    "--tag", "awa"])
+        self.assertEqual(argv[-5:], ["--max-unused", "unlimited",
+                                     "--repack-cacheable-only",
+                                     "--max-repack-size", "0"])
+        self.assertIn("--keep-daily", argv)
+
+    def test_init_only_when_missing(self):
+        os.environ["FAKE_RESTIC_CAT"] = "0"
+        self.assertEqual(awa.main(["backup", "--init"]), 0)
+        os.environ["FAKE_RESTIC_CAT"] = "10"
+        self.assertEqual(awa.main(["backup", "--init"]), 0)
+        self.assertEqual([c["argv"][0] for c in self.calls()],
+                         ["cat", "cat", "init"])
+
+    def test_restic_passthrough(self):
+        args = ["snapshots", "--tag", "awa", "--prune", "--help", "--", "-x"]
+        self.assertEqual(awa.main(["backup", "--restic", *args]), 0)
+        self.assertEqual(self.calls()[0]["argv"], args)
+        self.assertEqual(awa.main(["-C", "backup", "backup", "--restic",
+                                   "x"]), 0)
+        self.assertEqual(self.calls()[1]["argv"], ["x"])
+        awa.snapshot(self.repo)
+        real, ran = awa.subprocess.run, []
+
+        def run(cmd, *a, **k):
+            ran.append(cmd)
+            return real(cmd, *a, **k)
+        awa.subprocess.run = run  # only backup splits at --restic
+        try:
+            self.awa("log", "--", "backup", "--restic", "x")
+        finally:
+            awa.subprocess.run = real
+        self.assertEqual(ran[-1][-4:], ["--", "backup", "--restic", "x"])
+
+    def test_needs_config(self):
+        self.cfg.unlink()
+        with self.assertRaises(SystemExit):
+            awa.main(["backup"])
+        self.assertEqual(self.calls(), [])
+
+    def test_start_and_stop_timers(self):
+        os.environ["FAKE_SYSTEMCTL_LOG"] = str(self.tmp / "systemctl.log")
+        self.assertEqual(awa.main(["backup", "--start"]), 0)
+        d = Path(os.environ["XDG_CONFIG_HOME"]) / "systemd" / "user"
+        svc = (d / "awa-backup.service").read_text()
+        self.assertIn(f"{os.path.abspath(awa.__file__)} backup\n", svc)
+        self.assertIn("backup --prune\n",
+                      (d / "awa-backup-prune.service").read_text())
+        self.assertIn("OnCalendar=hourly", (d / "awa-backup.timer").read_text())
+        self.assertIn("enable --now awa-backup.timer awa-backup-prune.timer",
+                      (self.tmp / "systemctl.log").read_text())
+        self.assertEqual(awa.main(["backup", "--stop"]), 0)
+        self.assertFalse(any((d / u).exists() for u in awa.BACKUP_UNITS))
 
 
 if __name__ == "__main__":
