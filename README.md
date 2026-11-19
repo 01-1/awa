@@ -64,9 +64,8 @@ for example `~/code/proj` → `~/.local/share/awa/code/proj.git`. Repos
 outside `$HOME` go under `@abs/`. The store holds every object its history
 needs, so it survives the repo being deleted or recloned. Inspect it with
 `awa log`, or `git --git-dir "$(awa store)" show <commit>:<file>`.
-History that older versions kept in the repo itself (`refs/awa/record*`) is
-moved into the store on the next snapshot. A moved or renamed repo starts a
-new store at its new path; the old one stays where it was.
+The store is keyed by the repo's path. Moving or renaming the repo starts a
+separate store at the new path.
 
 ## Recording many repos
 
@@ -119,9 +118,8 @@ Tests: `python3 test_awa.py` (uses `~/.cache/awa-test`, or `AWA_TEST_DIR`).
 - `awa new` refuses a git worktree as the source repo. Create isolated
   copies from the main checkout.
 - The recorder uses one inotify watch per directory. Ignored directories
-  (by `.gitignore` or `.awaignore`) aren't watched. fanotify can't replace
-  this on a btrfs subvolume: there it reports writes but not creates,
-  deletes or renames. Changes to `.git/info/exclude` aren't noticed until the next
+  (by `.gitignore` or `.awaignore`) aren't watched. The recorder picks up
+  changes to `.git/info/exclude` after the next
   `.gitignore` change or restart.
 - `--test` runs in a temporary copy, so tests that write to absolute paths
   in the repo affect the real repo.
