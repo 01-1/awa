@@ -23,9 +23,11 @@ It does three things:
   and runs the test in a temporary copy of the repo. The repo is only changed
   by a final fast-forward, which git refuses if it would overwrite local or
   ignored files, or if the repo moved meanwhile. A conflict or failed test
-  leaves the repo as it was. Either way, the repo's branch is then merged
-  back into the copy the same safe way (computed with `git merge-tree`,
-  applied by fast-forward), so the agent sees everyone else's work.
+  leaves the repo as it was. Either way, awa then tries to merge the repo's
+  branch back into the copy the same safe way (computed with `git merge-tree`,
+  applied by fast-forward). Sync is skipped if the copy has uncommitted
+  tracked changes, and conflicts leave it unchanged. Commit the edits and
+  run `awa sync NAME` to retry; resolve conflicts in the copy.
 
 ## Use
 
@@ -92,8 +94,6 @@ for example `~/code/proj` → `~/.local/share/awa/code/proj.git`. Repos
 outside `$HOME` go under `@abs/`. The store holds every object its history
 needs, so it survives the repo being deleted or recloned. Inspect it with
 `awa log`, or `git --git-dir "$(awa store)" show <commit>:<file>`.
-History that older versions kept in the repo itself (`refs/awa/record*`) is
-moved into the store on the next snapshot.
 
 A moved or renamed repo keeps its history. awa writes a random id to
 `.git/awa/id` and keeps it in the store as `awa.id`. When a repo shows up at
@@ -102,10 +102,9 @@ has the same id, and renames it to the new path (or, if a store is already
 there, copies its refs in beside the existing ones as
 `refs/awa/record-moved-<time>-<commit>` and deletes it). Stores of repos
 nested inside the moved one follow it. This works whether the move happened
-while awa was running or not. Stores made before awa kept ids match when the
-repo's HEAD reflog, and no other recorded repo's, holds the commit their last
-snapshot was taken at. A copy
-of a recorded repo, with the original still present, gets an id and a store
+while awa was running or not. A store without an id matches when only the
+moved repo's HEAD reflog holds the commit from the store's last snapshot.
+A copy of a recorded repo, with the original still present, gets an id and a store
 of its own. If a new repo takes a moved repo's old path first, the old store
 is renamed aside (`<name>@awa-moved-<id>-<time>.git`) until the moved repo
 claims it.
@@ -217,12 +216,11 @@ Tests: `python3 test_awa.py` (uses `~/.cache/awa-test`, or `AWA_TEST_DIR`).
 
 - The store grows without limit. It stores only changed files, but
   nothing prunes it.
-- A git worktree as the source repo is refused. Run awa from the main
-  checkout.
+- `awa new` refuses a git worktree as the source repo. Create isolated
+  copies from the main checkout.
 - The recorder uses one inotify watch per directory. Ignored directories
-  (by `.gitignore` or `.awaignore`) aren't watched. fanotify can't replace
-  this on a btrfs subvolume: there it reports writes but not creates,
-  deletes or renames. Changes to `.git/info/exclude` aren't noticed until the next
+  (by `.gitignore` or `.awaignore`) aren't watched. The recorder picks up
+  changes to `.git/info/exclude` after the next
   `.gitignore` change or restart.
 - `--test` runs in a temporary copy, so tests that write to absolute paths
   in the repo affect the real repo.
